@@ -85,6 +85,7 @@ import { mountUserLibraryTables } from './prefs/user_library_tables.js';
 import { warmLibraryIndexes } from './libraryHosts.js';
 import '@ziroeda/common/widgets/shell.css';
 import { isBinaryBytes } from './home/files.js';
+import { archiveSource, withArchiveSource, type ArchiveSource } from './home/project_archiver.js';
 import { isToolingPath } from './home/project_picker.js';
 
 /**
@@ -542,6 +543,8 @@ export function App(): JSX.Element {
    *
    * Cleared by `openProjectFiles`, i.e. when a different project is opened.
    */
+  const editorSource = useRef<ArchiveSource>({ id: null, dirty: new Map() });
+  const drainQueue = useRef<() => void>(() => {});
   const liveEdits = useRef<Map<string, string>>(new Map());
   /**
    * Bumped once per *deliberate* project open, and by nothing else.
@@ -572,6 +575,11 @@ export function App(): JSX.Element {
   /** Open a project: replace the file set, drop the previous one's edits, and
    *  tell the editors this is an open and not just a state change. */
   const openProjectFiles = useCallback((files: PickedFile[] | null) => {
+    drainQueue.current();
+    pendingWrite.current.clear();
+    needsCloudPush.current = false;
+    editorSource.current = files ? archiveSource(files) : { id: null, dirty: new Map() };
+    setSessionSheets([]);
     liveEdits.current.clear();
     setProjectFiles(files);
     setOpenNonce((n) => n + 1);
@@ -609,6 +617,7 @@ export function App(): JSX.Element {
       const shown = shownFiles.current;
       const same =
         shown !== null &&
+        archiveSource(files) === editorSource.current &&
         shown.length === files.length &&
         files.every((f, i) => f.name === shown[i]!.name && f.text === shown[i]!.text);
       if (!same) {
@@ -938,7 +947,9 @@ export function App(): JSX.Element {
       const localId = await localIdForCloudUid(uid);
       const loaded = localId ? await loadProject(localId) : null;
       if (!loaded) return false;
-      openProjectFiles(openedFromStored(loaded.files));
+      const files = openedFromStored(loaded.files);
+      archiveSource(files).id = loaded.meta.id;
+      openProjectFiles(files);
       setOpenUid(uid);
       return true;
     },
@@ -1058,7 +1069,9 @@ export function App(): JSX.Element {
         const list = await listProjects();
         const loaded = list[0] ? await loadProject(list[0].id) : null;
         if (!loaded) return;
-        openProjectFiles(openedFromStored(loaded.files));
+        const files = openedFromStored(loaded.files);
+        archiveSource(files).id = loaded.meta.id;
+        openProjectFiles(files);
         setOpenUid((await cloudIdentityOf(list[0]!.id))?.uid ?? null);
         setStartFile(sess.startFile ?? null);
         mountFor(sess.view);
@@ -1172,24 +1185,36 @@ export function App(): JSX.Element {
 
   /** Whether the queued local write contains anything this user authored. */
   const needsCloudPush = useRef(false);
+  // A save already handed to IndexedDB may still be in flight when Archive
+  // reads the record. Keep those bytes until that particular write succeeds.
+  const markArchiveDirty = useCallback((files: { name: string; bytes: Uint8Array }[]) => {
+    const dirty = editorSource.current.dirty;
+    for (const f of files) dirty.set(f.name, f.bytes);
+    return () => {
+      for (const f of files) if (dirty.get(f.name) === f.bytes) dirty.delete(f.name);
+    };
+  }, []);
   const writePending = useCallback(() => {
     const cur = projectFilesRef.current;
     if (!cur || pendingWrite.current.size === 0 || !storageAvailable()) return;
     const files = [...pendingWrite.current].map(([name, bytes]) => ({ name, bytes }));
+    const written = markArchiveDirty(files);
+    const push = needsCloudPush.current;
+    needsCloudPush.current = false;
     pendingWrite.current = new Map();
     void (async () => {
       try {
-        const rec = (await listProjects()).find((p) => p.name === projectNameOf(cur));
-        if (rec) {
+        const rec = editorSource.current;
+        if (rec.id) {
           await updateProjectFiles(rec.id, files);
+          written();
           reportLocalFailed(false);
           reportLocalPending(false);
           // The work is on this machine; now get it into the account. Until
           // this existed, `pushProject` ran when a project was opened or renamed
           // and nowhere else, so an editing session reached the cloud only if
           // the user happened to sign in again afterwards.
-          if (needsCloudPush.current) scheduleCloudPush(rec.id);
-          needsCloudPush.current = false;
+          if (push) scheduleCloudPush(rec.id);
         } else {
           // No record to write to: an unsaved demo, or a project that has not
           // been persisted. Not a failure, but not saved either.
@@ -1202,17 +1227,23 @@ export function App(): JSX.Element {
         console.warn('Autosave failed:', e);
       }
     })();
-  }, [scheduleCloudPush]);
+  }, [scheduleCloudPush, markArchiveDirty]);
+  drainQueue.current = writePending;
+  const source = editorSource.current;
   const onProjectChange = useCallback(
     (changed: PickedFile[], opts?: { push?: boolean }) => {
       const cur = projectFilesRef.current;
-      if (!cur || !storageAvailable()) return;
+      if (!cur || source !== editorSource.current) return;
       const fullByBase = new Map(cur.map((f) => [pcbBasename(f.name), f.name]));
       const fresh = new Map<string, string>();
       for (const f of changed) {
-        const full = fullByBase.get(pcbBasename(f.name));
+        const full = cur.some((p) => p.name === f.name)
+          ? f.name
+          : fullByBase.get(pcbBasename(f.name));
         if (!full) continue;
-        pendingWrite.current.set(full, enc.encode(f.text));
+        const bytes = enc.encode(f.text);
+        source.dirty.set(full, bytes);
+        if (storageAvailable()) pendingWrite.current.set(full, bytes);
         // The in-memory project learns about the edit at the same moment the
         // write queue does. Anything that re-reads the project — the home tree,
         // a reopen, an editor remounting — then sees the work rather than the
@@ -1235,12 +1266,13 @@ export function App(): JSX.Element {
       // A batch that is only a peer's work is saved here and goes no further:
       // see `pendingIsMine` in SchematicEditor. Sticky until the write runs, so
       // a local edit queued alongside one still reaches the account.
+      if (!storageAvailable()) return;
       if (opts?.push !== false) needsCloudPush.current = true;
       reportLocalPending(true);
       clearTimeout(saveTimer.current);
       saveTimer.current = setTimeout(writePending, LOCAL_WRITE_IDLE_MS);
     },
-    [writePending],
+    [source, writePending],
   );
   /**
    * Every mounted editor's "serialise what you are holding, now" callback,
@@ -1324,23 +1356,27 @@ export function App(): JSX.Element {
    *    app wrote something". If autosave should record anything it is
    *    `kind: 'autosave'`, and that is a separate decision.
    */
-  const saveProjectFiles = useCallback(async (files: PickedFile[]): Promise<void> => {
-    const cur = projectFilesRef.current;
-    if (!cur || files.length === 0 || !storageAvailable()) return;
-    try {
-      const rec = (await listProjects()).find((p) => p.name === projectNameOf(cur));
-      if (!rec) return;
-      await updateProjectFiles(
-        rec.id,
-        files.map((f) => ({ name: f.name, bytes: enc.encode(f.text) })),
-      );
-      // Only now is the project on disk the thing worth remembering.
-      const loaded = await loadProject(rec.id);
-      if (loaded) await recordSnapshot(rec.id, loaded.files, 'save', rec.name);
-    } catch {
-      /* storage disabled */
-    }
-  }, []);
+  const saveProjectFiles = useCallback(
+    async (files: PickedFile[]): Promise<void> => {
+      const cur = projectFilesRef.current;
+      if (!cur || source !== editorSource.current || files.length === 0 || !storageAvailable())
+        return;
+      const bytes = files.map((f) => ({ name: f.name, bytes: enc.encode(f.text) }));
+      const written = markArchiveDirty(bytes);
+      try {
+        const rec = editorSource.current;
+        if (!rec.id) return;
+        await updateProjectFiles(rec.id, bytes);
+        written();
+        // Only now is the project on disk the thing worth remembering.
+        const loaded = await loadProject(rec.id);
+        if (loaded) await recordSnapshot(rec.id, loaded.files, 'save', loaded.meta.name);
+      } catch {
+        /* storage disabled */
+      }
+    },
+    [source, markArchiveDirty],
+  );
 
   /**
    * The restore half of `SCH_EDITOR_CONTROL::Revert`
@@ -1368,25 +1404,28 @@ export function App(): JSX.Element {
     const cur = projectFilesRef.current;
     if (!cur || !storageAvailable()) return false;
     try {
-      const rec = (await listProjects()).find((p) => p.name === projectNameOf(cur));
-      if (!rec) return false;
+      const rec = editorSource.current;
+      if (!rec.id) return false;
       const point = (await listSnapshots(rec.id)).find((s) => s.kind === 'save');
       if (!point) return false;
       const files = await readSnapshot(point.id);
       if (!files || files.length === 0) return false;
       await updateProjectFiles(rec.id, files);
-      openProjectFiles(openedFromStored(files));
+      if (editorSource.current !== rec) return false;
+      const restored = openedFromStored(files);
+      archiveSource(restored).id = rec.id;
+      openProjectFiles(restored);
       return true;
     } catch {
       return false;
     }
   }, [openProjectFiles]);
 
-  /** The open project's record in the store, found by name as persistFilesNow finds it. */
+  /** The record behind the editor files, absent for a demo or unsaved selection. */
   const openProjectRecordId = useCallback(async (): Promise<string | null> => {
     const cur = projectFilesRef.current;
     if (!cur || !storageAvailable()) return null;
-    return (await listProjects()).find((p) => p.name === projectNameOf(cur))?.id ?? null;
+    return editorSource.current.id;
   }, []);
 
   /** A demo's empty folders: kept for the session, as its other edits are. */
@@ -1426,22 +1465,26 @@ export function App(): JSX.Element {
     [demoProject, openProjectRecordId],
   );
 
-  const persistFilesNow = useCallback((files: PickedFile[]) => {
-    const cur = projectFilesRef.current;
-    if (!cur || files.length === 0 || !storageAvailable()) return;
-    void (async () => {
-      try {
-        const rec = (await listProjects()).find((p) => p.name === projectNameOf(cur));
-        if (rec)
-          await updateProjectFiles(
-            rec.id,
-            files.map((f) => ({ name: f.name, bytes: enc.encode(f.text) })),
-          );
-      } catch {
-        /* storage disabled */
-      }
-    })();
-  }, []);
+  const persistFilesNow = useCallback(
+    (files: PickedFile[]) => {
+      const cur = projectFilesRef.current;
+      if (!cur || source !== editorSource.current || files.length === 0 || !storageAvailable())
+        return;
+      const bytes = files.map((f) => ({ name: f.name, bytes: enc.encode(f.text) }));
+      const written = markArchiveDirty(bytes);
+      void (async () => {
+        try {
+          const rec = editorSource.current;
+          if (!rec.id) return;
+          await updateProjectFiles(rec.id, bytes);
+          written();
+        } catch {
+          /* storage disabled */
+        }
+      })();
+    },
+    [source, markArchiveDirty],
+  );
 
   /**
    * A library editor's write into the open project - a symbol or footprint library file, or
@@ -1454,19 +1497,20 @@ export function App(): JSX.Element {
    * brings in shows the moment it lands. The manager merges each batch into its tree.
    */
   const [projectWrites, setProjectWrites] = useState<{
+    source: ArchiveSource;
     files: { name: string; text: string }[];
     nonce: number;
   } | null>(null);
   const writeProjectFiles = useCallback(
     (files: { name: string; text: string }[]) => {
-      if (files.length === 0) return;
+      if (files.length === 0 || source !== editorSource.current) return;
       setProjectFiles((prev) =>
         prev ? [...prev.filter((f) => !files.some((n) => n.name === f.name)), ...files] : prev,
       );
-      setProjectWrites((w) => ({ files, nonce: (w?.nonce ?? 0) + 1 }));
+      setProjectWrites((w) => ({ files, source, nonce: (w?.nonce ?? 0) + 1 }));
       if (!demoProject) persistFilesNow(files);
     },
-    [demoProject, persistFilesNow],
+    [source, demoProject, persistFilesNow],
   );
 
   /**
@@ -1639,6 +1683,7 @@ export function App(): JSX.Element {
   const saveDemoCopy = useCallback(() => {
     const cur = projectFilesRef.current;
     if (!cur || cur.length === 0) return;
+    const copySource = editorSource.current;
     const suggested = projectNameOf(cur);
     const name = (window.prompt('Save a copy of this demo as:', suggested) ?? '').trim();
     if (!name) return;
@@ -1650,7 +1695,8 @@ export function App(): JSX.Element {
         const files = [...cur]
           .filter((f) => (f.bytes && f.bytes.length > 0) || f.text.length > 0)
           .map((f) => ({ name: f.name, bytes: f.bytes ?? enc.encode(f.text) }));
-        await saveProject(name, files);
+        copySource.id = await saveProject(name, files);
+        if (copySource !== editorSource.current) return;
         // Only now: until the record exists there is nothing for autosave to
         // find, and clearing the banner first would claim edits were being kept
         // while they still were not.
@@ -1944,10 +1990,14 @@ export function App(): JSX.Element {
       base && sessionSheets.length
         ? [...base, ...sessionSheets.filter((s) => !base.some((f) => f.name === s.name))]
         : base;
+    if (openFiles) withArchiveSource(openFiles, editorSource.current);
     shownFiles.current = openFiles;
     manager = (
       <HomePage
         initialFiles={openFiles}
+        flushForArchive={(files) => {
+          if (archiveSource(files) === editorSource.current) flushEditors();
+        }}
         activePro={activeProName ?? undefined}
         activeDemo={demoSource}
         onSwitchProject={switchProject}

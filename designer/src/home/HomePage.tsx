@@ -126,7 +126,14 @@ import {
 } from './project_tree.js';
 
 export type { PickedHomeFile } from './files.js';
-import { archiveEntries, zipArchive, expandArchive } from './project_archiver.js';
+import {
+  archiveSource,
+  withArchiveSource,
+  type ArchiveSource,
+  currentArchiveEntries,
+  zipArchive,
+  expandArchive,
+} from './project_archiver.js';
 import {
   type Activation,
   activationForFile,
@@ -220,6 +227,7 @@ export function HomePage({
   onOpenImageConverter,
   onOpenGerberViewer,
   initialFiles,
+  flushForArchive,
   activePro,
   activeDemo,
   onDemoStateChange,
@@ -297,6 +305,7 @@ export function HomePage({
     view?: 'schematic' | 'pcb' | 'symbols' | 'footprints';
   } | null;
   /** A project already open in the app: keep it in the tree on return to home. */
+  flushForArchive?: (files: PickedHomeFile[]) => void;
   initialFiles?: PickedHomeFile[] | null;
   /** The active project's .kicad_pro (full name) when a folder holds several. */
   activePro?: string;
@@ -336,7 +345,11 @@ export function HomePage({
     aFiles: PickedHomeFile[] | null,
   ) => void;
   /** Files the program wrote into the open project (App's writeProjectFiles), newest batch. */
-  projectWrites?: { files: { name: string; text: string }[]; nonce: number } | null;
+  projectWrites?: {
+    source: ArchiveSource;
+    files: { name: string; text: string }[];
+    nonce: number;
+  } | null;
 }): JSX.Element {
   const { session, signOut, recoveryKeyMnemonic, keyState, deleteAccount } = useAuth();
   const [deletingAccount, setDeletingAccount] = useState(false);
@@ -363,11 +376,14 @@ export function HomePage({
     if (!batch?.length) return;
 
     setPicked((prev) =>
-      prev
-        ? [
-            ...prev.filter((f) => !batch.some((n) => n.name === f.name)),
-            ...batch.map((f) => ({ ...f })),
-          ]
+      prev && archiveSource(prev) === projectWrites?.source
+        ? withArchiveSource(
+            [
+              ...prev.filter((f) => !batch.some((n) => n.name === f.name)),
+              ...batch.map((f) => ({ ...f })),
+            ],
+            projectWrites.source,
+          )
         : prev,
     );
   }, [projectWrites?.nonce]);
@@ -735,7 +751,7 @@ export function HomePage({
       return;
     }
     const files = importProjectFiles(plan);
-    await ingest(
+    archiveSource(files).id = await ingest(
       files.map((f) => ({ name: f.name, bytesOf: async () => f.bytes! })),
       true,
     );
@@ -1268,6 +1284,7 @@ export function HomePage({
               templateId,
             );
             saved = pid;
+            archiveSource(out).id = pid;
             refreshSaved();
             // LOCAL_HISTORY::CommitSnapshot, which upstream runs from the same
             // place a save does. Declines by itself when nothing changed, so
@@ -1458,6 +1475,7 @@ export function HomePage({
         opened = loaded.files
           .filter((f) => !isToolingPath(f.name))
           .map((f) => ({ name: f.name, text: projectFileText(f.bytes), bytes: f.bytes }));
+        archiveSource(opened).id = id;
         setPicked(opened);
       }
       await touchOpened(id); // resurface in Recent (ordered by last opened)
@@ -1610,12 +1628,17 @@ export function HomePage({
   // folder named for the project (see archive.ts). Here: collect, zip, download.
   const archiveProject = async (): Promise<void> => {
     if (!picked) return;
-    const name = projectNameOf(picked);
-    const entries = archiveEntries(picked, name);
-    if (!entries) return;
+    const legacy = picked.find((f) => /\.pro$/i.test(f.name));
+    const name =
+      legacy && !picked.some((f) => /\.kicad_pro$/i.test(f.name))
+        ? basename(legacy.name).replace(/\.pro$/i, '')
+        : projectNameOf(picked);
     setLoading({ title: 'Archive Project', label: 'Archiving project...' });
     await nextPaint(); // paint the overlay before zipSync blocks the main thread
     try {
+      flushForArchive?.(picked);
+      const entries = await currentArchiveEntries(picked, name, loadProject);
+      if (!entries) throw new Error('No project files qualify for the archive.');
       const blob = new Blob([zipArchive(entries)], { type: 'application/zip' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -1623,6 +1646,10 @@ export function HomePage({
       a.download = `${name}.zip`;
       a.click();
       URL.revokeObjectURL(url);
+    } catch (e) {
+      DisplayErrorMessage(
+        `Could not archive project: ${e instanceof Error ? e.message : String(e)}`,
+      );
     } finally {
       setLoading(null);
     }
@@ -1709,19 +1736,7 @@ export function HomePage({
     [proFile, picked],
   );
   const projLower = projName.toLowerCase();
-  /**
-   * The stored record the open project is, which is what its history is keyed
-   * on.
-   *
-   * Derived from the name rather than tracked, because that is already how the
-   * store identifies a project: `ingest` reuses "an existing record of the same
-   * name so reopening a folder updates it rather than piling up duplicates".
-   * Anything else here would be a second answer to the same question.
-   */
-  const openProjectId = useMemo(
-    () => (projName ? (saved.find((p) => p.name === projName)?.id ?? null) : null),
-    [saved, projName],
-  );
+  const openProjectId = picked ? archiveSource(picked).id : null;
 
   // Told as soon as it is known, the same shape as `onDemoStateChange`: the
   // address has to name the open project, and this is the only side that knows
