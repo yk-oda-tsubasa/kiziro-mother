@@ -9,6 +9,8 @@
  * tsconfig has no `--jsx` and cannot import a `.tsx` at all — a rule only the
  * component knows is untestable by construction.
  */
+import { serializeSchematic } from './sch_io/sexpr/schematic-text.js';
+import type { Schematic } from './types.js';
 import { SymbolLibAdapter } from './project_sch.js';
 import type { KICAD_MESSAGE_DIALOG_ARG } from '@ziroeda/common/confirm.js';
 import { IMPORT_PROJ_PROPS } from '@ziroeda/common/import_proj_properties.js';
@@ -232,11 +234,19 @@ export function PrepareSaveAsFiles(
 }
 
 export class SCH_FILES_IO_MIXIN {
+  /** Installed by the record bridge when the window opens a source-backed hierarchy. */
+  recordSaveSources?: () => ReadonlyMap<SCH_SCREEN, Schematic | null> | undefined;
+
   /**
    * `saveSchematicFile( aSheet, aSavePath )` (files-io.cpp:991): write one sheet's screen to
    * \a aSavePath on the mounted file system.
    */
-  saveSchematicFile(this: SCH_EDIT_FRAME, aSheet: SCH_SHEET, aSavePath: string): boolean {
+  saveSchematicFile(
+    this: SCH_EDIT_FRAME,
+    aSheet: SCH_SHEET,
+    aSavePath: string,
+    recordSources?: ReadonlyMap<SCH_SCREEN, Schematic | null>,
+  ): boolean {
     const screen = aSheet.GetScreen();
 
     if (!screen) return false; // wxCHECK
@@ -262,16 +272,18 @@ export class SCH_FILES_IO_MIXIN {
 
     const projectFile = schematicFileName.replace(/\.[^./]*$/, `.${PROJECT_FILE_EXTENSION}`);
 
-    // Save various ERC settings, such as violation severities (which may have been edited
-    // via the ERC dialog as well as the Schematic Setup dialog), ERC exclusions, etc.
-    if (wxFileExists(projectFile)) this.saveProjectSettings();
-
-    // `m_infoBar->GetMessageType() == OUTDATED_SAVE`: this infobar keeps no message type.
-
     let success: boolean;
-
     try {
-      const text = new SCH_IO_KICAD_SEXPR().SaveSchematicFile(aSheet, this.Schematic());
+      const sources = recordSources ?? this.recordSaveSources?.();
+      // The record editor's setup dialogs own project settings. The live
+      // settings are a partial projection and must not overwrite .kicad_pro.
+      if (!sources && wxFileExists(projectFile)) this.saveProjectSettings();
+      if (sources && !sources.has(screen))
+        throw new Error('Sheet no longer belongs to the validated hierarchy');
+      const source = sources?.get(screen);
+      const text = source
+        ? serializeSchematic(source)
+        : new SCH_IO_KICAD_SEXPR().SaveSchematicFile(aSheet, this.Schematic());
 
       success = wxWriteFileSync(schematicFileName, new TextEncoder().encode(text));
 
@@ -459,6 +471,13 @@ export class SCH_FILES_IO_MIXIN {
       if (answer === wxID_CANCEL) return false;
     }
 
+    let sources: ReadonlyMap<SCH_SCREEN, Schematic | null> | undefined;
+    try {
+      sources = this.recordSaveSources?.();
+    } catch (error) {
+      this.DisplayError(error instanceof Error ? error.message : String(error));
+      return false;
+    }
     screens.BuildClientSheetPathList();
 
     for (let i = 0; i < screens.GetCount(); i++) {
@@ -499,7 +518,7 @@ export class SCH_FILES_IO_MIXIN {
       // This is a new schematic file so make sure it has a unique ID.
       if (!saveCopy && tmpFn !== screen.GetFileName()) screen.AssignNewUuid();
 
-      const savedThisSheet = this.saveSchematicFile(screens.GetSheet(i)!, tmpFn);
+      const savedThisSheet = this.saveSchematicFile(screens.GetSheet(i)!, tmpFn, sources);
 
       success &&= savedThisSheet;
     }
@@ -510,32 +529,34 @@ export class SCH_FILES_IO_MIXIN {
     // `LockFile( ... )` and `UpdateFileHistory( ... )` are the desktop's lock file and recent-file
     // list; the project store keeps neither.
 
-    // Save the sheet name map to the project file
-    const projectSheets = this.Prj().GetProjectFile().GetSheets();
-    projectSheets.length = 0;
+    if (!sources || aSaveAs) {
+      // Save the sheet name map to the project file
+      const projectSheets = this.Prj().GetProjectFile().GetSheets();
+      projectSheets.length = 0;
 
-    for (const sheetPath of this.Schematic().Hierarchy()) {
-      const sheet = sheetPath.Last();
+      for (const sheetPath of this.Schematic().Hierarchy()) {
+        const sheet = sheetPath.Last();
 
-      if (!sheet) continue; // wxCHECK2
+        if (!sheet) continue; // wxCHECK2
 
-      // Do not save the virtual root sheet
-      if (!sheet.IsVirtualRootSheet())
-        projectSheets.push({ first: sheet.m_Uuid, second: sheet.GetName() });
-    }
+        // Do not save the virtual root sheet
+        if (!sheet.IsVirtualRootSheet())
+          projectSheets.push({ first: sheet.m_Uuid, second: sheet.GetName() });
+      }
 
-    const rootFile = filenameMap.get(this.Schematic().RootScreen()!)!;
-    const projectPath = rootFile.replace(/\.[^./]*$/, `.${PROJECT_FILE_EXTENSION}`);
-    const manager = Pgm().GetSettingsManager();
+      const rootFile = filenameMap.get(this.Schematic().RootScreen()!)!;
+      const projectPath = rootFile.replace(/\.[^./]*$/, `.${PROJECT_FILE_EXTENSION}`);
+      const manager = Pgm().GetSettingsManager();
 
-    if (this.Prj().IsNullProject() || (aSaveAs && !saveCopy)) {
-      this.Prj().SetReadOnly(!createNewProject);
-      manager.SaveProjectAs(projectPath);
-    } else if (saveCopy && createNewProject) {
-      manager.SaveProjectCopy(projectPath);
-    } else {
-      this.SaveProjectLocalSettings();
-      this.saveProjectSettings();
+      if (this.Prj().IsNullProject() || (aSaveAs && !saveCopy)) {
+        this.Prj().SetReadOnly(!createNewProject);
+        manager.SaveProjectAs(projectPath);
+      } else if (saveCopy && createNewProject) {
+        manager.SaveProjectCopy(projectPath);
+      } else {
+        this.SaveProjectLocalSettings();
+        this.saveProjectSettings();
+      }
     }
 
     // `Kiway().LocalHistory()` snapshots and autosave-file cleanup, and `TriggerBackupIfNeeded`:

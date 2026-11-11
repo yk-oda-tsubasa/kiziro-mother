@@ -459,6 +459,7 @@ const SYMBOL_CHILD_ORDER = [
   'at',
   'mirror',
   'unit',
+  'convert',
   'body_style',
   'exclude_from_sim',
   'in_bom',
@@ -551,17 +552,18 @@ function patchUnit(node: SList, unit: number): SList {
   return insertCanonical(node, list(atom('unit'), atom(String(unit))));
 }
 
-/** Patch `(body_style N)`; insert canonically when absent and not style 1.
+/** Patch the body style (KiCad 9 spells it `convert`); insert only for non-default styles.
  *  saveSymbol writes it unconditionally, but adding it to a file that never had
  *  it would churn every symbol, so it appears once the style leaves 1. */
-function patchBodyStyle(node: SList, bodyStyle: number): SList {
-  const child = childNamed(node, 'body_style');
+function patchBodyStyle(node: SList, bodyStyle: number, version: number): SList {
+  const token = version <= 20250114 && !childNamed(node, 'body_style') ? 'convert' : 'body_style';
+  const child = childNamed(node, token);
   if (child) {
     if (numArg(child, 0) === bodyStyle) return node;
-    return mapChild(node, 'body_style', () => list(atom('body_style'), atom(String(bodyStyle))));
+    return mapChild(node, token, () => list(atom(token), atom(String(bodyStyle))));
   }
   if (bodyStyle === 1) return node;
-  return insertCanonical(node, list(atom('body_style'), atom(String(bodyStyle))));
+  return insertCanonical(node, list(atom(token), atom(String(bodyStyle))));
 }
 
 /** The `(property "Reference" "…")` value of the node this symbol was read from. */
@@ -689,13 +691,13 @@ function patchLibName(node: SList, libName: string | undefined): SList {
   return existing ? mapChild(node, 'lib_name', () => child) : insertCanonical(node, child);
 }
 
-function writeSymbol(sym: SchSymbol): SList {
+function writeSymbol(sym: SchSymbol, version: number): SList {
   let node = patchLibName(sym.source, sym.libName);
   node = patchAt(node, sym.at);
   node = patchAtAngle(node, sym.angle);
   node = patchMirror(node, sym.mirror);
   node = patchUnit(node, sym.unit);
-  node = patchBodyStyle(node, sym.bodyStyle);
+  node = patchBodyStyle(node, sym.bodyStyle, version);
   if (sym.excludedFromSim !== undefined)
     node = patchSymbolBool(node, 'exclude_from_sim', sym.excludedFromSim, false);
   node = patchSymbolBool(node, 'in_bom', sym.inBom, true);
@@ -1630,7 +1632,7 @@ function writeSchematicBody(sch: Schematic): SList {
     ...labelsOfKind('global_label'), // SCH_GLOBAL_LABEL_T
     ...labelsOfKind('hierarchical_label'), // SCH_HIER_LABEL_T
     ...(sch.directiveLabels ?? []).map(writeDirectiveLabel), // SCH_DIRECTIVE_LABEL_T
-    ...sch.symbols.map(writeSymbol), // SCH_SYMBOL_T
+    ...sch.symbols.map((sym) => writeSymbol(sym, sch.version)), // SCH_SYMBOL_T
     // Empty groups are never written (SCH_IO_KICAD_SEXPR::saveGroup).
     ...sch.groups.filter((g) => g.members.length > 0).map(writeGroup), // SCH_GROUP_T
     ...sch.sheets.map(writeSheet), // SCH_SHEET_T

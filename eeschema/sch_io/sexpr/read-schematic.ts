@@ -686,7 +686,8 @@ function readSymbol(node: SList): SchSymbol {
     at,
     angle,
     unit: numArg(childNamed(node, 'unit') ?? node, 0) ?? 1,
-    bodyStyle: numArg(childNamed(node, 'body_style') ?? node, 0) ?? 1,
+    bodyStyle:
+      numArg(childNamed(node, 'body_style') ?? childNamed(node, 'convert') ?? node, 0) ?? 1,
     inBom: boolField(node, 'in_bom', true),
     onBoard: boolField(node, 'on_board', true),
     dnp: boolField(node, 'dnp', false),

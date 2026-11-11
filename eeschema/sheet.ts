@@ -614,6 +614,23 @@ export class SCH_SHEET_MIXIN {
     if (!schematic.Root().SearchHierarchy(newAbsoluteFilename, useScreen))
       loadFromFile = wxFileExists(newAbsoluteFilename);
 
+    // A fresh or renamed file has no source record to preserve. Refuse before
+    // InitSheet, the import copy, or the rename's direct filesystem write.
+    const screen = aSheet.GetScreen();
+    if ((!screen || screen.GetFileName() !== newAbsoluteFilename) && !useScreen.value) {
+      try {
+        if (this.recordSaveSources?.()) {
+          this.DisplayError(
+            `Cannot create or relink '${newAbsoluteFilename}' without a KiCad 9 source record.`,
+          );
+          return false;
+        }
+      } catch (error) {
+        this.DisplayError(error instanceof Error ? error.message : String(error));
+        return false;
+      }
+    }
+
     const shortName = newAbsoluteFilename.replace(/^.*\//, '');
 
     if (aSheet.GetScreen() === null) {

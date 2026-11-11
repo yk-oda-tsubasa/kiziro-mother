@@ -115,6 +115,7 @@ import type { KIWAY } from '@ziroeda/common/kiway.js';
 import { SCH_EDIT_FRAME } from './sch_edit_frame.js';
 import type { SCH_SHEET_PATH } from './sch_sheet_path.js';
 import { parse } from '@ziroeda/sexpr';
+import { serializeSheetFiles } from './sch_io/sexpr/schematic-text.js';
 import {
   applySchematicPatch,
   diffSchematic,
@@ -134,6 +135,7 @@ import {
   ruleAreaNetclassAssignments,
   type LabelSpin,
   readSchematic,
+  readSchematicText,
   serializeSchematic,
   readSymbolLib,
   serializeSymbolLib,
@@ -1740,6 +1742,18 @@ export function SchematicEditor({
   // TRANSITIONAL (S2-5b, gone at S7): the frame's live SCHEMATIC, rebuilt from the window's
   // records when one changed (sch_record_bridge.ts).
   const syncLiveRef = useRef<() => boolean>(() => false);
+  const rollbackPending = useRef(false);
+  const inEditLiveRef = useRef(false);
+  const canSaveRecords = useCallback(() => {
+    if (rollbackPending.current || inEditLiveRef.current) return false;
+    try {
+      schFrameRef.current?.recordSaveSources?.();
+      return true;
+    } catch (error) {
+      setError(error instanceof Error ? error.message : String(error));
+      return false;
+    }
+  }, []);
   const editLiveRef = useRef<NonNullable<SchScriptApi['editLive']>>(async () => null);
   const liveFilesRef = useRef<{
     rawFiles: readonly PickedFile[];
@@ -2089,6 +2103,7 @@ export function SchematicEditor({
       syncLiveSchematic: () => syncLiveRef.current(),
       modalAnnotate: (aMessage) => modalAnnotateRef.current(aMessage),
       symbolLibraryUri: (aNickname) => symbolLibraryUri(liveFilesRef.current.rawFiles)(aNickname),
+      displayError: (message) => setError(message),
       liveModified: () => liveModifiedRef.current(),
       liveSheetChanged: () => liveSheetChangedRef.current(),
       ercDialog: () => ercDialogFactoryRef.current(),
@@ -2219,7 +2234,7 @@ export function SchematicEditor({
       pendingClearHistory.current = false;
       history.current.clear();
     }
-    if (pendingProjectChange.current.length === 0) return;
+    if (pendingProjectChange.current.length === 0 || !canSaveRecords()) return;
     const files = pendingProjectChange.current;
     const persist = pendingPersist.current;
     const mine = pendingIsMine.current;
@@ -2876,7 +2891,7 @@ export function SchematicEditor({
       next = applySchematicPatch(current, pendingRemoteChange.patch);
     } else {
       try {
-        next = { ...readSchematic(parse(pendingRemoteChange.text)), fileName: target.file };
+        next = readSchematicText(pendingRemoteChange.text, target.file);
       } catch {
         return; // malformed text mid-broadcast; wait for the next update
       }
@@ -3203,13 +3218,13 @@ export function SchematicEditor({
   annotatePlacementRef.current = annotatePlacement;
 
   /** Every live screen, handed back to the window's records after a multi-sheet live edit. */
-  const adoptAllLiveScreens = useCallback((): void => {
+  const adoptAllLiveScreens = useCallback((): boolean => {
     const frame = schFrameRef.current;
-    if (!frame) return;
+    if (!frame) return false;
     const all: SCH_SCREEN[] = [];
     const screens = new SCH_SCREENS(frame.Schematic().Root());
     for (let sc = screens.GetFirst(); sc; sc = screens.GetNext()) all.push(sc);
-    adoptLiveScreensRef.current(all);
+    return !adoptLiveScreensRef.current(all);
   }, []);
 
   // DIALOG_ANNOTATE::OnAnnotateClick (dialog_annotate.cpp:245-264): one SCH_COMMIT over the
@@ -3237,7 +3252,7 @@ export function SchematicEditor({
         SYMBOL_FILTER.SYMBOL_FILTER_NON_POWER,
       );
       commit.Push('Annotate');
-      adoptAllLiveScreens();
+      if (!adoptAllLiveScreens()) return;
       setAnnotateMessages([...reporter.lines]);
 
       const usedDesignators = frame.Schematic().Settings().m_refDesTracker?.Serialize() ?? '';
@@ -3253,7 +3268,7 @@ export function SchematicEditor({
       if (!frame) return;
       const reporter = new Reporter();
       frame.DeleteAnnotation(ANNOTATE_SCOPE_OF[scope], recursive, reporter);
-      adoptAllLiveScreens();
+      if (!adoptAllLiveScreens()) return;
       setAnnotateMessages([...reporter.lines]);
     },
     [adoptAllLiveScreens],
@@ -3604,7 +3619,7 @@ export function SchematicEditor({
       setLoading(`Loading ${name ?? 'untitled.kicad_sch'}...`);
       await nextPaint();
       try {
-        const next = { ...readSchematic(parse(text)), fileName: name ?? 'untitled.kicad_sch' };
+        const next = readSchematicText(text, name ?? 'untitled.kicad_sch');
         const file = name ?? 'untitled.kicad_sch';
         project.current = { docs: new Map([[file, next]]), root: file };
         history.current.clear();
@@ -3674,7 +3689,7 @@ export function SchematicEditor({
           // the dialog showed its blank reservation for the whole read.
           await nextPaint();
           try {
-            docs.set(base, { ...readSchematic(parse(f.text)), fileName: base });
+            docs.set(base, readSchematicText(f.text, base));
           } catch (e) {
             problems.push(`${base}: ${e instanceof Error ? e.message : String(e)}`);
           }
@@ -3851,19 +3866,11 @@ export function SchematicEditor({
 
   // Serialize the project's sheets (current sheet + resident others) for autosave.
   const serializeSheets = useCallback((): PickedFile[] => {
-    if (!doc) return [];
+    if (!docRef.current || !canSaveRecords()) return [];
     const docs = new Map(project.current.docs);
-    docs.set(currentFile, doc);
-    const files: PickedFile[] = [];
-    for (const [file, d] of docs) {
-      try {
-        files.push({ name: file, text: serializeSchematic(d) });
-      } catch {
-        /* skip a bad sheet */
-      }
-    }
-    return files;
-  }, [doc, currentFile]);
+    docs.set(currentFileRef.current, docRef.current);
+    return serializeSheetFiles(docs);
+  }, [canSaveRecords]);
 
   // Autosave: once edits settle, hand the sheets up (App debounces the write to
   // IndexedDB). Fires on sheet switch/load too, re-saving identical content.
@@ -3999,7 +4006,7 @@ export function SchematicEditor({
     // — and it must not be where the work is decided: the document is read from
     // its ref instead.
     const d = docRef.current;
-    if (!d) return;
+    if (!d || !canSaveRecords()) return false;
     let text: string;
     try {
       text = serializeSchematic(d);
@@ -4008,7 +4015,7 @@ export function SchematicEditor({
       // safe *because* we were about to write it, which is exactly backwards
       // when the write is the thing that failed.
       setInfoBar(`Could not save: ${e instanceof Error ? e.message : String(e)}`);
-      return;
+      return false;
     }
     if (onSaveFiles && currentFile !== DEFAULT_FILE) {
       // Save writes into the project's file manager (cloud storage); a local
@@ -4031,7 +4038,8 @@ export function SchematicEditor({
     // Only now: the asterisk and the leave-prompt both mean "written".
     setDirty(false);
     setUnsaved(false);
-  }, [fileName, currentFile, onPersistFiles, onSaveFiles]);
+    return true;
+  }, [fileName, currentFile, onPersistFiles, onSaveFiles, canSaveRecords]);
   // MAIL_SCH_GET_NETLIST is answered by the frame from its live SCHEMATIC (ReadyToNetlist,
   // NETLIST_EXPORTER_KICAD); this keeps that schematic the window's: every sheet's record, the
   // open one with the edits its file only gets on the debounced save, opened through
@@ -4044,7 +4052,7 @@ export function SchematicEditor({
     const name = projectName ?? project.current.root.replace(/\.[^.]*$/, '');
     if (!name) return;
     const enc = new TextEncoder();
-    const dec = new TextDecoder();
+    const dec = new TextDecoder('utf-8', { ignoreBOM: true });
     const fs = new MEMORY_FILESYSTEM();
     for (const f of rawFiles) fs.Write(f.name, enc.encode(f.text));
     fs.SetWriteListener((aRel, aData) => {
@@ -4073,8 +4081,9 @@ export function SchematicEditor({
     return unmount;
   }, [rawFiles, projectName, onPersistFiles, rootPro, designBlocksPane]);
   const liveMirrorRef = useRef<LIVE_SCHEMATIC_MIRROR | null>(null);
-  const inEditLiveRef = useRef(false);
-  const adoptLiveScreensRef = useRef<(aScreens: Iterable<SCH_SCREEN>) => void>(() => {});
+  const adoptLiveScreensRef = useRef<(aScreens: Iterable<SCH_SCREEN>) => string | undefined>(
+    () => undefined,
+  );
   const liveModifiedRef = useRef<() => void>(() => {});
   const liveSheetChangedRef = useRef<() => void>(() => {});
   const showingLiveRef = useRef(false);
@@ -4097,6 +4106,10 @@ export function SchematicEditor({
           dir: `/${name ?? root.replace(/\.[^.]*$/, '')}`,
           docs,
           root,
+          assertCanSave: () => {
+            if (rollbackPending.current || inEditLiveRef.current)
+              throw new Error('Cannot save until the current schematic edit is complete');
+          },
           files: files
             .filter((f) => /\.kicad_(pro|prl)$/i.test(f.name))
             .map((f) => ({ name: f.name, text: f.text })),
@@ -4321,6 +4334,20 @@ export function SchematicEditor({
 
   // SchScriptApi.editLive: an edit on the live model, its screens written back into the window
   // as one undo step (sch_record_bridge.ts liveScreensToRecords; TRANSITIONAL until S7).
+  const rollbackLiveEdit = (error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    setError(message);
+    rollbackPending.current = true;
+    liveMirrorRef.current?.Invalidate();
+    // Replace the rejected screen and redisplay the original sheet after its tool unwinds.
+    queueMicrotask(() => {
+      if (syncLiveRef.current()) {
+        showLiveRef.current();
+        rollbackPending.current = false;
+      }
+    });
+    return message;
+  };
   editLiveRef.current = async (aEdit) => {
     if (!syncLiveRef.current()) return null;
     const frame = schFrameRef.current!;
@@ -4331,14 +4358,15 @@ export function SchematicEditor({
     } catch (e) {
       // The edit may have changed the live model before it threw; the window has not changed,
       // so the next sync rebuilds the live model from it.
-      liveMirrorRef.current?.Invalidate();
+      rollbackLiveEdit(e);
       throw e;
     } finally {
       inEditLiveRef.current = false;
     }
     const { result: screens, messages } = edit;
     if (!screens) return messages.length ? messages : ['nothing was changed'];
-    adoptLiveScreensRef.current(screens);
+    const error = adoptLiveScreensRef.current(screens);
+    if (error) throw new Error(error);
     return messages;
   };
   // The live model's changed screens written back as the window's records (sch_record_bridge.ts
@@ -4350,10 +4378,16 @@ export function SchematicEditor({
   adoptLiveScreensRef.current = (screens) => {
     // A viewer's tab keeps no edits (runProject's guard, kept for the write-back).
     if (myRoleRef.current === 'viewer') return;
+    if (rollbackPending.current) return 'Cannot adopt edits while restoring the source records';
     const frame = schFrameRef.current!;
     const name = liveFilesRef.current.projectName;
     const dir = `/${name ?? project.current.root.replace(/\.[^.]*$/, '')}`;
-    const docs = liveScreensToRecords(frame, screens, dir);
+    let docs: Map<string, Schematic>;
+    try {
+      docs = liveScreensToRecords(frame, screens, dir);
+    } catch (error) {
+      return rollbackLiveEdit(error);
+    }
     const here = currentFileRef.current;
     const changed: PickedFile[] = [];
     for (const [file, d] of docs) {
@@ -4417,8 +4451,9 @@ export function SchematicEditor({
   // `SaveProject()`: an assignment from this same mail round is written as it
   // folds; with nothing pending, the open sheet is saved now.
   saveProjectRef.current = () => {
-    if (assignPendingRef.current) saveRequestedRef.current = true;
-    else save();
+    if (!assignPendingRef.current) return save();
+    if (!canSaveRecords()) return false;
+    saveRequestedRef.current = true;
     return true;
   };
 
@@ -4488,7 +4523,7 @@ export function SchematicEditor({
   const saveCurrSheetCopyTo = useCallback(
     (picked: string) => {
       const d = docRef.current;
-      if (!d) return;
+      if (!d || !canSaveRecords()) return;
 
       const seed = copyAsSeed;
       const trimmed = picked.split('/').filter(Boolean).pop()?.trim() ?? '';
@@ -4525,7 +4560,7 @@ export function SchematicEditor({
       setUnsaved(false);
       setStatusText(savedFileMessage(seed));
     },
-    [copyAsSeed, currentFile, onPersistFiles],
+    [copyAsSeed, currentFile, onPersistFiles, canSaveRecords],
   );
 
   /**
@@ -6318,11 +6353,10 @@ export function SchematicEditor({
                     exports.company ||
                     exports.comments.some(Boolean);
                   const frame = schFrameRef.current;
-                  if (exported && frame) {
-                    const all: SCH_SCREEN[] = [];
-                    const screens = new SCH_SCREENS(frame.Schematic().Root());
-                    for (let sc = screens.GetFirst(); sc; sc = screens.GetNext()) all.push(sc);
-                    adoptLiveScreensRef.current(all);
+                  if (rollbackPending.current || (exported && frame && !adoptAllLiveScreens())) {
+                    setPageDialog(null);
+                    pageDialog.resolve(wxID_CANCEL);
+                    return;
                   }
                   adoptDrawingSheet(drawingSheet, drawingSheetName);
                   setPageDialog(null);
