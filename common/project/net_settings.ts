@@ -51,8 +51,12 @@ export interface NetClassAssignment {
   pattern: string;
   netClass: string;
 }
+export interface NetClassRow extends NetClass {
+  /** Panel-only identity; a newly inserted grid row has no original name. */
+  originalName?: string;
+}
 export interface NetClassesData {
-  classes: NetClass[];
+  classes: NetClassRow[];
   assignments: NetClassAssignment[];
   /**
    * `net_settings.net_colors` — `NET_SETTINGS::m_netColorAssignments`, a net

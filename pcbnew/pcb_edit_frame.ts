@@ -156,6 +156,7 @@ import { INITPCB_MIXIN } from './initpcb.js';
 import { EDIT_MIXIN } from './edit.js';
 import { FILES_MIXIN } from './files.js';
 import { EDIT_ZONE_HELPERS_MIXIN } from './edit_zone_helpers.js';
+import type { JsonObject } from '@ziroeda/common/settings/json_settings.js';
 import { PCBNEW_CONFIG_MIXIN } from './pcbnew_config.js';
 import type { LIB_ID } from '@ziroeda/common/lib_id.js';
 import type { PCB_SELECTION_FILTER_OPTIONS } from '@ziroeda/common/project/board_project_settings.js';
@@ -1189,6 +1190,10 @@ export class PCB_EDIT_FRAME extends PCB_BASE_EDIT_FRAME {
    * `PCB_EDIT_FRAME` rather than on the shared base, and is never null.
    */
   private readonly m_layerPairSettings = new LAYER_PAIR_SETTINGS();
+
+  /** Project settings at the last load/save; board geometry and local visibility are independent. */
+  m_savedFrameSettings: ReturnType<PCBNEW_CONFIG_MIXIN['ProjectSettingsSnapshot']> | null = null;
+  m_savedProjectSettings: { source: JsonObject; live: JsonObject } | null = null;
 
   constructor(hooks: PCB_EDIT_FRAME_HOOKS) {
     super(FRAME_T.FRAME_PCB_EDITOR);

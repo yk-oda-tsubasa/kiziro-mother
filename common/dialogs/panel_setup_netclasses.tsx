@@ -37,6 +37,7 @@ import {
   LINE_STYLES,
   blankNetClass as blankClass,
   type NetClass,
+  type NetClassRow,
   type NetClassAssignment,
   type NetClassesData,
 } from '../project/net_settings.js';
@@ -81,8 +82,9 @@ const numStr = (v: number | undefined): string => (v === undefined ? '' : String
 export const PANEL_SETUP_NETCLASSES = {
   TransferDataToWindow(aSettings: NET_SETTINGS): NetClassesData {
     const mm = (iu: number): number => pcbIUScale.iuToMM(iu);
-    const toRow = (nc: NETCLASS): NetClass => ({
+    const toRow = (nc: NETCLASS): NetClassRow => ({
       name: nc.GetName(),
+      originalName: nc.GetName(),
       clearance: nc.HasClearance() ? numStr(mm(nc.GetClearance())) : '',
       trackWidth: nc.HasTrackWidth() ? numStr(mm(nc.GetTrackWidth())) : '',
       viaSize: nc.HasViaDiameter() ? numStr(mm(nc.GetViaDiameter())) : '',
@@ -229,24 +231,31 @@ export function PanelSetupNetclasses({
 }: Props): JSX.Element {
   // `loadNetclasses`: by priority, then Default in the last row.
   const gridClasses = [...value.classes.slice(1), ...value.classes.slice(0, 1)];
-  const dpViaGapOf = (aName: string): string =>
-    value.classes.find((c) => c.name === aName)?.dpViaGap ?? '';
+  // This read-only column travels with SwapRows, insert and delete, including pasted edits.
+  const originCol = GRID_COLS.length;
 
-  const nc = useStringGrid<NetClass>({
-    labels: GRID_COLS.map((c) => c.label),
+  const nc = useStringGrid<NetClassRow>({
+    labels: [...GRID_COLS.map((c) => c.label), 'Original Name'],
     mode: wxGridSelectionModes.wxGridSelectRows,
     rows: gridClasses,
-    toCells: (c) => GRID_COLS.map((col) => c[col.key]),
+    toCells: (c) => [...GRID_COLS.map((col) => c[col.key]), c.originalName ?? ''],
     fromCells: (cells) => {
-      const c = blankClass(cells[GRID_NAME]!);
+      const c: NetClassRow = blankClass(cells[GRID_NAME]!);
       GRID_COLS.forEach((col, i) => {
         c[col.key] = cells[i]!;
       });
-      c.dpViaGap = dpViaGapOf(c.name);
+      const origin = cells[originCol];
+      if (origin) c.originalName = origin;
+      c.dpViaGap = value.classes.find((row) =>
+        origin ? row.originalName === origin : row.name === c.name,
+      )?.dpViaGap ?? '';
       return c;
     },
     onChange: (rows) => onChange({ ...value, classes: [...rows.slice(-1), ...rows.slice(0, -1)] }),
     setup: (g) => {
+      const originAttr = new wxGridCellAttr();
+      originAttr.SetReadOnly();
+      g.SetColAttr(originCol, originAttr);
       // The Default row: its name, colours and line style are fixed.
       const last = g.GetNumberRows() - 1;
 

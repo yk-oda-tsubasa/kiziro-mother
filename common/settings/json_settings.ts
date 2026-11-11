@@ -320,6 +320,18 @@ export class JSON_SETTINGS {
     return this.m_internals;
   }
 
+  /** Compare live settings across edits without storing into the loaded file or clearing dirty flags. */
+  SnapshotToJson(): JsonObject {
+    const snapshot = new JSON_SETTINGS(this.m_filename, this.m_location, this.m_schemaVersion);
+    snapshot.m_internals = structuredClone(this.m_internals);
+    snapshot.m_params = this.m_params;
+    snapshot.Store();
+    for (const child of this.m_nested_settings)
+      snapshot.Set(child.GetFilename(), child.SnapshotToJson());
+    // A parameter getter can return a live array or object.
+    return structuredClone(snapshot.m_internals);
+  }
+
   /** Reset all parameters to default values. */
   ResetToDefaults(): void {
     for (const param of this.m_params) param.SetDefault();

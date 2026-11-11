@@ -78,6 +78,33 @@ describe('JSON_SETTINGS', () => {
 });
 
 describe('PROJECT_LOCAL_SETTINGS', () => {
+  it.each([
+    { version: 2, input: [25, 39], names: ['drc_errors', 'pads', 'shapes'] },
+    { version: 3, input: [0, 5, 6, 19], names: ['vias', 'footprint_text', 'tracks', 'shapes'] },
+    { version: 4, input: [0, 5, 6, 19], names: ['vias', 'footprint_text', 'tracks'] },
+    { version: 4, input: [41], names: ['shapes'] },
+    { version: 3, input: ['tracks', 'ly_points'], names: ['tracks', 'ly_points'] },
+    { version: 3, input: ['none'], names: ['none'] },
+  ])('writes v$version $input as schema 5 names', ({ version, input, names }) => {
+    const s = new PROJECT_LOCAL_SETTINGS('p');
+    s.LoadFromJson({ meta: { version }, board: { visible_items: input } });
+    const saved = s.SaveToJson();
+    expect(saved.meta).toMatchObject({ version: 5 });
+    expect(s.Get('board.visible_items')).toEqual(names);
+  });
+
+  it('keeps a future schema and unknown visibility entries intact', () => {
+    const s = new PROJECT_LOCAL_SETTINGS('p');
+    const future = { meta: { version: 9 }, board: { visible_items: ['tracks', 'future'] } };
+    s.LoadFromJson(future);
+    expect(s.SaveToJson()).toEqual(future);
+    s.m_VisibleItems.setLayer(GAL_LAYER_ID.LAYER_VIAS);
+    expect(s.SaveToJson()).toEqual({
+      meta: { version: 9 },
+      board: { visible_items: ['future', 'vias', 'tracks'] },
+    });
+  });
+
   it('reads visible items by NAME and leaves the non-user items untouched', () => {
     const s = new PROJECT_LOCAL_SETTINGS('p.kicad_prl');
     s.LoadFromJson({ board: { visible_items: ['tracks', 'vias'] } });

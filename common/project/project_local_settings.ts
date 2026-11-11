@@ -132,7 +132,50 @@ export class SCH_SELECTION_FILTER_OPTIONS {
 }
 
 /** `projectLocalSettingsVersion`. */
-const projectLocalSettingsVersion = 3;
+const projectLocalSettingsVersion = 5;
+
+// Historical GAL offsets from KiCad 10.0.8's 4 -> 5 migration.
+const legacyVisibilityNames: Readonly<Record<number, string>> = {
+  0: 'vias',
+  5: 'footprint_text',
+  8: 'footprint_anchors',
+  11: 'ratsnest',
+  12: 'grid',
+  15: 'footprints_front',
+  16: 'footprints_back',
+  17: 'footprint_values',
+  18: 'footprint_references',
+  19: 'tracks',
+  23: 'drc_errors',
+  24: 'drawing_sheet',
+  30: 'bitmaps',
+  32: 'pads',
+  33: 'zones',
+  36: 'drc_warnings',
+  37: 'drc_exclusions',
+  39: 'locked_item_shadows',
+  40: 'conflict_shadows',
+  41: 'shapes',
+};
+
+const v2Offsets: Readonly<Record<number, number>> = {
+  22: 34,
+  23: 22,
+  24: 35,
+  25: 23,
+  26: 36,
+  27: 37,
+  28: 38,
+  29: 24,
+  30: 25,
+  31: 26,
+  32: 27,
+  33: 28,
+  34: 29,
+  35: 30,
+  39: 32,
+  40: 33,
+};
 
 /** `SetIfPresent`: a key that is absent leaves the field alone. */
 function setIfPresent<T extends boolean | number | string>(
@@ -159,7 +202,8 @@ export class PROJECT_LOCAL_SETTINGS extends JSON_SETTINGS {
    * both together); there is no PROJECT link here.
    */
   override SaveToFile(aDirectory = '', aForce = false): boolean {
-    this.Set<string>('meta.filename', `${this.m_filename}.${this.getFileExt()}`);
+    if (!this.IsFutureFormat())
+      this.Set<string>('meta.filename', `${this.m_filename}.${this.getFileExt()}`);
 
     // Even if parameters were not modified, we should resave after migration
     const force = aForce || this.m_wasMigrated;
@@ -244,6 +288,28 @@ export class PROJECT_LOCAL_SETTINGS extends JSON_SETTINGS {
 
     this.m_deleteLegacyAfterMigration = false;
 
+    const path = 'board.visible_items';
+    const migrateOffsets = (version: number, convert: (items: JsonValue[]) => JsonValue[]) =>
+      this.registerMigration(version, version + 1, () => {
+        const items = this.GetJson(path);
+        // Earlier Web saves already used names, including the explicit "none" marker.
+        if (Array.isArray(items) && !(items.length && items.every((v) => typeof v === 'string')))
+          this.Set(path, convert(items));
+        this.m_wasMigrated = true;
+        return true;
+      });
+
+    migrateOffsets(1, (items) => [...items, 32, 33]);
+    migrateOffsets(2, (items) =>
+      items.map((v) => (typeof v === 'number' ? (v2Offsets[v] ?? v) : v)),
+    );
+    migrateOffsets(3, (items) => (items.length ? [...items, 41] : []));
+    migrateOffsets(4, (items) =>
+      items.flatMap((v) =>
+        typeof v === 'number' && legacyVisibilityNames[v] ? [legacyVisibilityNames[v]!] : [],
+      ),
+    );
+
     this.addParam(
       new PARAM_LAMBDA<string>(
         'board.visible_layers',
@@ -270,6 +336,13 @@ export class PROJECT_LOCAL_SETTINGS extends JSON_SETTINGS {
           // Explicit marker to tell apart a wiped-out array from the user hiding everything
           if (ret.length === 0) ret.push('none');
 
+          const original = this.GetJson('board.visible_items');
+          if (
+            Array.isArray(original) &&
+            original.length === ret.length &&
+            ret.every((name) => original.includes(name))
+          )
+            return original;
           return ret;
         },
         (aVal) => {
@@ -312,8 +385,12 @@ export class PROJECT_LOCAL_SETTINGS extends JSON_SETTINGS {
         'board.selection_filter',
         () => {
           const f = this.m_PcbSelectionFilter;
+          const stored = this.GetJson('board.selection_filter');
+          const original =
+            stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {};
 
           return {
+            ...original,
             lockedItems: f.lockedItems,
             footprints: f.footprints,
             text: f.text,
@@ -324,7 +401,8 @@ export class PROJECT_LOCAL_SETTINGS extends JSON_SETTINGS {
             zones: f.zones,
             keepouts: f.keepouts,
             dimensions: f.dimensions,
-            points: f.points,
+            // Native 10.0.8 omits the Web points filter when it is at its default.
+            ...('points' in original || !f.points ? { points: f.points } : {}),
             otherItems: f.otherItems,
           };
         },
@@ -627,6 +705,32 @@ export class PROJECT_LOCAL_SETTINGS extends JSON_SETTINGS {
     this.addParam(
       new PARAM<boolean>('git.integration_disabled', ref(this, 'm_GitIntegrationDisabled'), false),
     );
+  }
+
+  override LoadFromJson(json: JsonValue): void {
+    this.m_isFutureFormat = false;
+    super.LoadFromJson(json);
+  }
+
+  /** In a newer schema only patch recognized visibility flags in a compatible named list. */
+  override Store(): boolean {
+    if (!this.IsFutureFormat()) return super.Store();
+    const entries = this.GetJson('board.visible_items');
+    if (!Array.isArray(entries) || !entries.every((v) => typeof v === 'string')) return false;
+    const known = entries.flatMap((name) => RenderLayerFromVisbilityString(name) ?? []);
+    if (!known.length && !entries.includes('none')) return false;
+    const visible = this.m_VisibleItems.and(UserVisbilityLayers());
+    if (visible.equals(new GAL_SET(known))) return false;
+
+    const names = entries.filter(
+      (name) => name !== 'none' && RenderLayerFromVisbilityString(name) === undefined,
+    );
+    for (const layer of visible.Seq())
+      names.push(VisibilityLayerToString(VisibilityLayerFromRenderLayer(layer)!));
+    if (!visible.any()) names.push('none');
+    this.Set('board.visible_items', names);
+    this.m_modified = true;
+    return true;
   }
 
   /** `SaveFileState`: record a file as open or closed, with its window. */

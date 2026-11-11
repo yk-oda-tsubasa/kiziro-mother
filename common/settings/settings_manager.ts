@@ -148,7 +148,7 @@ export class SETTINGS_MANAGER {
 
     const settings = new PROJECT_LOCAL_SETTINGS(project.GetProjectName());
 
-    if (aPrlJson !== null) settings.LoadFromJson(aPrlJson);
+    settings.LoadFromJson(aPrlJson ?? {});
 
     project.setLocalSettings(settings);
 

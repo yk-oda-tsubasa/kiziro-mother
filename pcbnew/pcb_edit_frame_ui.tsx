@@ -620,6 +620,33 @@ function storedPcbGridIU(cfg: PCBNEW_JSON_SETTINGS_LIKE): number {
 const EMPTY_TOGGLED: ReadonlySet<string> = new Set();
 const AUTO_TRACK_WIDTH_ON: ReadonlySet<string> = new Set(['autoTrackWidth']);
 
+const objectLayers = {
+  tracks: GAL_LAYER_ID.LAYER_TRACKS,
+  vias: GAL_LAYER_ID.LAYER_VIAS,
+  pads: GAL_LAYER_ID.LAYER_PADS,
+  zones: GAL_LAYER_ID.LAYER_ZONES,
+  filledShapes: GAL_LAYER_ID.LAYER_FILLED_SHAPES,
+  images: GAL_LAYER_ID.LAYER_DRAW_BITMAPS,
+  footprintsFront: GAL_LAYER_ID.LAYER_FOOTPRINTS_FR,
+  footprintsBack: GAL_LAYER_ID.LAYER_FOOTPRINTS_BK,
+  fpValues: GAL_LAYER_ID.LAYER_FP_VALUES,
+  fpReferences: GAL_LAYER_ID.LAYER_FP_REFERENCES,
+  fpText: GAL_LAYER_ID.LAYER_FP_TEXT,
+  ratsnest: GAL_LAYER_ID.LAYER_RATSNEST,
+  drcWarnings: GAL_LAYER_ID.LAYER_DRC_WARNING,
+  drcErrors: GAL_LAYER_ID.LAYER_DRC_ERROR,
+  drcExclusions: GAL_LAYER_ID.LAYER_DRC_EXCLUSION,
+  anchors: GAL_LAYER_ID.LAYER_ANCHOR,
+  points: GAL_LAYER_ID.LAYER_POINTS,
+  lockedShadow: GAL_LAYER_ID.LAYER_LOCKED_ITEM_SHADOW,
+  collidingCourtyards: GAL_LAYER_ID.LAYER_CONFLICTS_SHADOW,
+  boardAreaShadow: GAL_LAYER_ID.LAYER_BOARD_OUTLINE_AREA,
+  drawingSheet: GAL_LAYER_ID.LAYER_DRAWINGSHEET,
+  grid: GAL_LAYER_ID.LAYER_GRID,
+} satisfies Record<keyof ObjectState, GAL_LAYER_ID>;
+
+const objectLayerKeys = Object.keys(objectLayers) as (keyof ObjectState)[];
+
 /**
  * A GAL zoom factor turned into our view scale, and back.
  *
@@ -2049,12 +2076,30 @@ export function PcbEditor({
           ? 'all'
           : 'visible',
     );
-    setObjects((p) =>
-      p.ratsnest === cfg.m_Display.m_ShowGlobalRatsnest
-        ? p
-        : { ...p, ratsnest: cfg.m_Display.m_ShowGlobalRatsnest },
-    );
+    const ratsnest = frame.GetBoard()?.IsElementVisible(GAL_LAYER_ID.LAYER_RATSNEST);
+    if (ratsnest !== undefined)
+      setObjects((p) => (p.ratsnest === ratsnest ? p : { ...p, ratsnest }));
   };
+
+  function loadBoardAppearance(kb: BOARD): void {
+    const objects = { ...DEFAULT_OBJECTS };
+    for (const key of objectLayerKeys) objects[key] = kb.IsElementVisible(objectLayers[key]);
+    setObjects(objects);
+    const enabled = kb.GetEnabledLayers();
+    setVisible(
+      new Set(
+        enabled
+          .Seq()
+          .filter((id) => kb.IsLayerVisible(id))
+          .map(LSET.Name),
+      ),
+    );
+    const local = kb.GetProject()?.GetLocalSettings();
+    if (local) {
+      setAutoTrackWidth(local.m_AutoTrackWidth);
+      if (enabled.test(local.m_ActiveLayer)) setActiveLayer(LSET.Name(local.m_ActiveLayer));
+    }
+  }
   /** The Layer Display Options radios' `setHighContrastMode` (appearance_controls.cpp:487-497). */
   const onHighContrastMode = (aMode: 'normal' | 'dim' | 'hide'): void => {
     const frame = frameRef.current;
@@ -2831,6 +2876,7 @@ export function PcbEditor({
           false,
           projectDirRef.current,
         );
+        loadBoardAppearance(kb);
         setBoardModel({ k: kb, fileName: fileNameRef.current });
         setDirty(true);
 
@@ -3395,7 +3441,7 @@ export function PcbEditor({
         // vanished dialog reads as "no board".
         firstPaintPendingRef.current = b;
         setBoard(b);
-        setVisible(new Set(enabledLayerNames(b.k)));
+        loadBoardAppearance(b.k);
         // `PCB_EDIT_FRAME::OpenProjectFiles`' preload (pcbnew/files.cpp:610):
         // the footprint libraries are paid for now, in the background. See
         // ./preload.ts.
@@ -3807,43 +3853,15 @@ export function PcbEditor({
     [requestDraw],
   );
 
-  /**
-   * `PCB_EDIT_FRAME::ShowBoardSetupDialog`, the OK half: every panel's
-   * TransferDataFromWindow into the live BOARD / BOARD_DESIGN_SETTINGS /
-   * PROJECT_FILE, then the syncs, tickers and repaints upstream does after
-   * `ShowQuasiModal() == wxID_OK`. The `.kicad_pro` is then what
-   * `SETTINGS_MANAGER::SaveProject()` writes (upstream writes it on the next
-   * board save; here it is persisted at once, as every edit is), the `.kicad_dru`
-   * is the Custom Rules text, and the board goes out through the normal save
-   * when something board-side moved.
-   */
-  /**
-   * `SETTINGS_MANAGER::SaveProject()`: the `.kicad_pro` written from the live
-   * PROJECT_FILE, and the `.kicad_dru` when a rules text is handed in. Upstream
-   * writes the project on the next board save; here it is persisted at once, as
-   * every edit is. What changed it is the caller's business: Board Setup's OK,
-   * a net or net-class colour, Assign Netclass, the teardrop targets.
-   */
+  /** Board Setup and individual project edits are persisted immediately. */
   const saveProjectSettings = useCallback(
-    (aRulesText?: string): void => {
-      const prj = frameRef.current?.Prj();
-      if (!prj) return;
+    (aRulesText?: string, classes?: BoardSetupValues['netClasses']['classes']): void => {
+      const frame = frameRef.current;
+      if (!frame) return;
       const files = projectFilesNow();
       const baseOf = (name: string): string =>
         (projectFiles ?? []).find((f) => f.name === name)?.text ?? '';
-      const persist: { name: string; text: string }[] = [];
-      const pro = findProjectPro(files, rootPro);
-      const saved = Pgm().GetSettingsManager().SaveProject(prj);
-      if (pro && saved) {
-        const updated = DumpJson(saved.pro);
-        if (updated !== pro.text) persist.push({ name: pro.name, text: updated });
-        if (aRulesText !== undefined) {
-          const druName = druFileName(pro.name);
-          const dru = findProjectDru(files, rootPro);
-          if (dru ? aRulesText !== dru.text : aRulesText.trim() !== '')
-            persist.push({ name: dru?.name ?? druName, text: aRulesText });
-        }
-      }
+      const persist = frame.SaveExplicitProjectFiles(files, rootPro, aRulesText, classes);
       if (persist.length) {
         for (const f of persist)
           projectFileEditsRef.current.set(f.name, { base: baseOf(f.name), text: f.text });
@@ -3868,13 +3886,13 @@ export function PcbEditor({
   }, [boardSetupOpen]);
 
   const commitBoardSetup = useCallback(
-    (next: BoardSetupValues) => {
+    (next: BoardSetupValues, edited: ReadonlySet<keyof BoardSetupValues>) => {
       const frame = frameRef.current;
       const kb = frame?.GetBoard();
       if (!frame || !kb) return;
       const prj = frame.Prj();
 
-      const modified = BoardSetupFromWindow(next, kb, prj);
+      const modified = BoardSetupFromWindow(next, kb, prj, edited);
 
       // Note: We must synchronise time domain properties before nets and classes, otherwise the
       // updates called by the board listener events are using stale data
@@ -3897,7 +3915,10 @@ export function PcbEditor({
       if (panel) boardSetupRepaint(frame, panel, kb);
 
       // .kicad_pro + .kicad_dru, persisted now.
-      saveProjectSettings(next.customRules.text);
+      saveProjectSettings(
+        next.customRules.text,
+        edited.has('netClasses') ? next.netClasses.classes : undefined,
+      );
       setBoardSettingsRev((n) => n + 1);
 
       // We don't know if anything was modified, so err on the side of requiring a save
@@ -5874,7 +5895,7 @@ export function PcbEditor({
     // `RunAction( PCB_ACTIONS::trackViaSizeChanged )` (edit_track_width.cpp:224):
     // a route in flight takes the new size at once.
     if (changed) frameRef.current?.GetToolManager()?.RunAction(PCB_ACTIONS.trackViaSizeChanged);
-  }, [boardK, trackSel, viaSel, autoTrackWidth]);
+  }, [boardK, boardSettingsRev, trackSel, viaSel, autoTrackWidth]);
 
   // ----- what APPEARANCE_CONTROLS is handed ------------------------------------
   //
@@ -5968,40 +5989,16 @@ export function PcbEditor({
     opts.m_FilledShapeOpacity = opacity.filledShapes;
     opts.m_FlipBoardView = viewRef.current.flipX;
     const visibleLayers = new Set<PCB_LAYER_ID>();
-    for (const name of visible) {
-      const id = kb.GetLayerID(name);
-      if (id >= 0) visibleLayers.add(id);
-    }
-    const G = GAL_LAYER_ID;
-    const visibleElements = new Map<GAL_LAYER_ID, boolean>([
-      [G.LAYER_TRACKS, objects.tracks],
-      [G.LAYER_VIAS, objects.vias],
-      [G.LAYER_PADS, objects.pads],
-      [G.LAYER_ZONES, objects.zones],
-      [G.LAYER_FILLED_SHAPES, objects.filledShapes],
-      [G.LAYER_DRAW_BITMAPS, objects.images],
-      [G.LAYER_FOOTPRINTS_FR, objects.footprintsFront],
-      [G.LAYER_FOOTPRINTS_BK, objects.footprintsBack],
-      [G.LAYER_FP_VALUES, objects.fpValues],
-      [G.LAYER_FP_REFERENCES, objects.fpReferences],
-      [G.LAYER_FP_TEXT, objects.fpText],
-      [G.LAYER_RATSNEST, objects.ratsnest],
-      [G.LAYER_DRC_WARNING, objects.drcWarnings],
-      [G.LAYER_DRC_ERROR, objects.drcErrors],
-      [G.LAYER_DRC_EXCLUSION, objects.drcExclusions],
-      [G.LAYER_ANCHOR, objects.anchors],
-      [G.LAYER_POINTS, objects.points],
-      [G.LAYER_LOCKED_ITEM_SHADOW, objects.lockedShadow],
-      [G.LAYER_CONFLICTS_SHADOW, objects.collidingCourtyards],
-      [G.LAYER_BOARD_OUTLINE_AREA, objects.boardAreaShadow],
-      [G.LAYER_DRAWINGSHEET, objects.drawingSheet],
-      [G.LAYER_GRID, objects.grid],
-    ]);
+    for (const id of kb.GetEnabledLayers().Seq())
+      if (visible.has(LSET.Name(id))) visibleLayers.add(id);
+    const visibleElements = new Map(
+      objectLayerKeys.map((key) => [objectLayers[key], objects[key]] as const),
+    );
     const state: EditorDisplayState = {
       visibleLayers,
       visibleElements,
       displayOptions: opts,
-      activeLayer: kb.GetLayerID(activeLayer),
+      activeLayer: LSET.NameToLayer(activeLayer),
       colorTheme: theme.filename,
     };
     // The net colour assignments the painter's NET_COLOR_MODE reads
@@ -6282,8 +6279,8 @@ export function PcbEditor({
   /**
    * `PCB_EDIT_FRAME::SaveProjectLocalSettings` (`SavePcbFile` calls it once the
    * board is written, files.cpp:1125): this window's Appearance state into the
-   * frame, the frame's into PROJECT_LOCAL_SETTINGS, and the two files
-   * `SETTINGS_MANAGER::SaveProject()` returns out to the project's file store.
+   * frame, the frame's into PROJECT_LOCAL_SETTINGS, and the resulting files
+   * out to the project's file store.
    */
   const saveProjectLocalSettings = (): void => {
     const frame = frameRef.current;
@@ -6303,8 +6300,10 @@ export function PcbEditor({
     const baseOf = (name: string): string =>
       (projectFiles ?? []).find((f) => f.name === name)?.text ?? '';
     const persist: { name: string; text: string }[] = [];
-    const proText = DumpJson(saved.pro);
-    if (proText !== pro.text) persist.push({ name: pro.name, text: proText });
+    if (saved.pro) {
+      const proText = DumpJson(saved.pro);
+      if (proText !== pro.text) persist.push({ name: pro.name, text: proText });
+    }
     const prlName = pro.name.replace(/\.kicad_pro$/i, '.kicad_prl');
     const prlText = DumpJson(saved.prl);
     if (prlText !== files.find((f) => f.name === prlName)?.text)
@@ -8784,8 +8783,8 @@ export function PcbEditor({
           frame={frameRef.current}
           value={boardSetup}
           initialPage={boardSetupPage}
-          onOk={(next) => {
-            commitBoardSetup(next);
+          onOk={(next, edited) => {
+            commitBoardSetup(next, edited);
             setBoardSetupOpen(false);
           }}
           onClose={() => setBoardSetupOpen(false)}

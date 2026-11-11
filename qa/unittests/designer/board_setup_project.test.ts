@@ -206,7 +206,12 @@ describe('Board Setup, the .kicad_pro side', () => {
       assignments: [{ ...want.componentClasses.assignments[0]!, conditions: [field, r, c, side] }],
     });
     expect(back.tuningProfiles).toEqual(want.tuningProfiles);
-    expect(back.netClasses).toEqual(want.netClasses);
+    expect(written).not.toMatch(/"originalName"\s*:/);
+    // On reopen, each saved class has a panel identity derived from its persisted name.
+    expect(back.netClasses).toEqual({
+      ...want.netClasses,
+      classes: want.netClasses.classes.map((row) => ({ ...row, originalName: row.name })),
+    });
     expect(back.textVars).toEqual(want.textVars);
   });
 

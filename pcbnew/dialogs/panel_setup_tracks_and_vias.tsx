@@ -59,7 +59,11 @@ export const PANEL_SETUP_TRACKS_AND_VIAS = {
   },
 
   /** Sorted, with a dummy "use netclass" entry first. */
-  TransferDataFromWindow(v: PredefinedSizes, aBoard: BOARD): void {
+  TransferDataFromWindow(
+    v: PredefinedSizes,
+    aBoard: BOARD,
+    changed: (key: keyof PredefinedSizes) => boolean = () => true,
+  ): void {
     const bds = aBoard.GetDesignSettings();
     const iu = (mm: number): number => pcbIUScale.mmToIU(mm);
     const widths = v.trackWidthsMM.map(iu).sort((a, b) => a - b);
@@ -69,9 +73,10 @@ export const PANEL_SETUP_TRACKS_AND_VIAS = {
     const pairs = v.diffPairsMM
       .map((d) => new DIFF_PAIR_DIMENSION(iu(d.width), iu(d.gap), iu(d.viaGap)))
       .sort((a, b) => a.m_Width - b.m_Width || a.m_Gap - b.m_Gap || a.m_ViaGap - b.m_ViaGap);
-    bds.m_TrackWidthList = [0, ...widths];
-    bds.m_ViasDimensionsList = [new VIA_DIMENSION(0, 0), ...vias];
-    bds.m_DiffPairDimensionsList = [new DIFF_PAIR_DIMENSION(0, 0, 0), ...pairs];
+    if (changed('trackWidthsMM')) bds.m_TrackWidthList = [0, ...widths];
+    if (changed('viaSizesMM')) bds.m_ViasDimensionsList = [new VIA_DIMENSION(0, 0), ...vias];
+    if (changed('diffPairsMM'))
+      bds.m_DiffPairDimensionsList = [new DIFF_PAIR_DIMENSION(0, 0, 0), ...pairs];
   },
 };
 

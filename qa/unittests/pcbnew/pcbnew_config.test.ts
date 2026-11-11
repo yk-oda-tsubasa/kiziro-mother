@@ -10,9 +10,11 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { MEMORY_FILESYSTEM, wxMountFileSystem } from '@ziroeda/wx/filefn.js';
+import { PANEL_SETUP_NETCLASSES } from '@ziroeda/common/dialogs/panel_setup_netclasses.js';
 import { BASE_SCREEN } from '@ziroeda/common/base_screen.js';
 import { PGM_BASE, SETTINGS_MANAGER, SetPgm } from '@ziroeda/common/pgm_base.js';
 import { PCB_LAYER_ID } from '@ziroeda/common/layer_id.js';
+import { NETCLASS } from '@ziroeda/common/netclass.js';
 import type { Color4d } from '@ziroeda/common/gal/color4d.js';
 import { COLOR4D_UNSPECIFIED } from '@ziroeda/common/gal/color4d.js';
 import {
@@ -150,6 +152,76 @@ beforeEach(() => {
   BASE_SCREEN.m_DrawingSheetFileName = '';
 });
 afterEach(() => SetPgm(null));
+
+describe('SaveEditedProjectSettings netclass metadata', () => {
+  function open(classes: JsonValue[]) {
+    const source = { net_settings: { classes } };
+    const { frame } = setup(source);
+    frame.SyncProjectSettingsIntoBoard(
+      [{ name: 'x.kicad_pro', text: JSON.stringify(source) }],
+      'x',
+      true,
+      '/p',
+    );
+    const netclasses = frame.Prj().GetProjectFile().NetSettings().GetNetclasses();
+    const save = () => {
+      const settings = frame.SaveEditedProjectSettings()!.pro!.net_settings;
+      return (settings as { classes: JsonValue[] }).classes;
+    };
+    return { frame, netclasses, save };
+  }
+
+  it('keeps sparse source fields with their class across reorder, insertion and deletion', () => {
+    const a = { name: 'A', vendor: { value: 1 } };
+    const b = { name: 'B', vendor: { value: 2 } };
+    const base = { name: 'Default', vendor: null };
+    // The live serializer always moves Default to the front.
+    const { netclasses, save } = open([a, base, b]);
+    const first = netclasses.get('A')!;
+    netclasses.delete('A');
+    netclasses.set('A', first);
+    first.SetTrackWidth(500000);
+    const edited = { ...a, track_width: 0.5 };
+    expect(save()).toEqual([base, b, edited]);
+
+    netclasses.set('New', new NETCLASS('New', false));
+    const inserted = save();
+    expect(inserted).toEqual([base, b, edited, expect.objectContaining({ name: 'New' })]);
+    expect(inserted[3]).not.toHaveProperty('vendor');
+    netclasses.delete('B');
+    expect(save()).toEqual([base, edited, inserted[3]]);
+  });
+
+  it('refuses a panel rename when duplicate source names have collapsed into one class', () => {
+    const { frame } = open([{ name: 'A', vendor: 1 }, { name: 'A', vendor: 2 }]);
+    const draft = PANEL_SETUP_NETCLASSES.TransferDataToWindow(frame.Prj().GetProjectFile().NetSettings());
+    draft.classes.find((row) => row.name === 'A')!.name = 'B';
+    expect(frame.NetclassRenameError(draft.classes)).toMatch(/fix its duplicate or invalid name/i);
+    expect(frame.SaveEditedProjectSettings()!.pro).toBeNull();
+  });
+
+  it('saves live edits without inheriting fields from ambiguous or replaced rows', () => {
+    const { netclasses, save } = open([
+      { name: 'Default' },
+      { name: 'A', vendor: 1 },
+      { name: 'A', vendor: 2 },
+      { name: '7', vendor: 4 },
+      { name: 7, track_width: 0.5 },
+      { name: 'Old', vendor: 3 },
+    ]);
+    netclasses.get('A')!.SetClearance(250000);
+    netclasses.delete('Old');
+    netclasses.set('New', new NETCLASS('New', false));
+    const rows = save();
+    expect(rows).toEqual([
+      { name: 'Default' },
+      expect.objectContaining({ name: 'A', clearance: 0.25 }),
+      expect.objectContaining({ name: '7', track_width: 0.5 }),
+      expect.objectContaining({ name: 'New' }),
+    ]);
+    for (const row of rows) expect(row).not.toHaveProperty('vendor');
+  });
+});
 
 describe('NetColorAssignmentsToCodes (pcbnew_config.cpp:95-105)', () => {
   it('maps a named net to its code and drops UNSPECIFIED and unknown names', () => {

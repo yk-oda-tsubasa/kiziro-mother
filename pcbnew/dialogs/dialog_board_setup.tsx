@@ -352,6 +352,15 @@ export function BoardSetupToWindow(
   };
 }
 
+/** Compare the controls before OK sorts size lists and clamps constraints. */
+export function editedBoardSetupFields(initial: BoardSetupValues, draft: BoardSetupValues) {
+  return new Set(
+    (Object.keys(initial) as (keyof BoardSetupValues)[]).filter(
+      (key) => JSON.stringify(initial[key]) !== JSON.stringify(draft[key]),
+    ),
+  );
+}
+
 /**
  * Every page's `TransferDataFromWindow`, in page order. Returns true when
  * something on the *board* side changed (the panels' `m_frame->OnModify()`);
@@ -361,33 +370,50 @@ export function BoardSetupFromWindow(
   v: BoardSetupValues,
   aBoard: BOARD,
   aProject: PROJECT,
+  edited?: ReadonlySet<keyof BoardSetupValues>,
 ): boolean {
+  // A panel may normalize defaults on transfer even when its controls were untouched.
+  const changed = (key: keyof BoardSetupValues) => !edited || edited.has(key);
   let modified = false;
-  modified = PANEL_SETUP_LAYERS.TransferDataFromWindow(v.layers, aBoard) || modified;
-  modified =
-    PANEL_SETUP_BOARD_STACKUP.TransferDataFromWindow(v.physicalStackup, aBoard) || modified;
-  modified = PANEL_SETUP_BOARD_FINISH.TransferDataFromWindow(v.boardFinish, aBoard) || modified;
-  modified = PANEL_SETUP_MASK_AND_PASTE.TransferDataFromWindow(v.maskPaste, aBoard) || modified;
-  PANEL_SETUP_ZONE_HATCH_OFFSETS.TransferDataFromWindow(v.zoneLayerProperties, aBoard);
-  PANEL_SETUP_TEXT_AND_GRAPHICS.TransferDataFromWindow(v.textGraphics, aBoard);
-  PANEL_SETUP_DIMENSIONS.TransferDataFromWindow(v.dimensions, aBoard.GetDesignSettings());
-  modified = PANEL_SETUP_FORMATTING.TransferDataFromWindow(v.formatting, aBoard) || modified;
-  PANEL_TEXT_VARIABLES.TransferDataFromWindow(v.textVars, aProject);
-  PANEL_SETUP_CONSTRAINTS.TransferDataFromWindow(v.constraints, aBoard);
-  PANEL_SETUP_TRACKS_AND_VIAS.TransferDataFromWindow(v, aBoard);
-  PANEL_SETUP_TEARDROPS.TransferDataFromWindow(v.teardrops, aBoard);
-  PANEL_SETUP_TUNING_PATTERNS.TransferDataFromWindow(v.tuning, aBoard);
-  PANEL_SETUP_TUNING_PROFILES.TransferDataFromWindow(v.tuningProfiles, aProject);
-  PANEL_SETUP_NETCLASSES.TransferDataFromWindow(
-    v.netClasses,
-    aProject.GetProjectFile().NetSettings(),
-  );
-  PANEL_ASSIGN_COMPONENT_CLASSES.TransferDataFromWindow(v.componentClasses, aProject);
-  PANEL_SETUP_SEVERITIES.TransferDataFromWindow(v.drcSeverities, aBoard);
-  modified =
-    PANEL_EMBEDDED_FILES.TransferDataFromWindow(v.embeddedFiles, aBoard.GetEmbeddedFiles()) ||
-    modified;
-  PANEL_SETUP_ZONES.TransferDataFromWindow(v.zones, aBoard);
+  if (changed('layers'))
+    modified = PANEL_SETUP_LAYERS.TransferDataFromWindow(v.layers, aBoard) || modified;
+  if (changed('physicalStackup'))
+    modified =
+      PANEL_SETUP_BOARD_STACKUP.TransferDataFromWindow(v.physicalStackup, aBoard) || modified;
+  if (changed('boardFinish'))
+    modified = PANEL_SETUP_BOARD_FINISH.TransferDataFromWindow(v.boardFinish, aBoard) || modified;
+  if (changed('maskPaste'))
+    modified = PANEL_SETUP_MASK_AND_PASTE.TransferDataFromWindow(v.maskPaste, aBoard) || modified;
+  if (changed('zoneLayerProperties'))
+    PANEL_SETUP_ZONE_HATCH_OFFSETS.TransferDataFromWindow(v.zoneLayerProperties, aBoard);
+  if (changed('textGraphics'))
+    PANEL_SETUP_TEXT_AND_GRAPHICS.TransferDataFromWindow(v.textGraphics, aBoard);
+  if (changed('dimensions'))
+    PANEL_SETUP_DIMENSIONS.TransferDataFromWindow(v.dimensions, aBoard.GetDesignSettings());
+  if (changed('formatting'))
+    modified = PANEL_SETUP_FORMATTING.TransferDataFromWindow(v.formatting, aBoard) || modified;
+  if (changed('textVars')) PANEL_TEXT_VARIABLES.TransferDataFromWindow(v.textVars, aProject);
+  if (changed('constraints')) PANEL_SETUP_CONSTRAINTS.TransferDataFromWindow(v.constraints, aBoard);
+  if (changed('trackWidthsMM') || changed('viaSizesMM') || changed('diffPairsMM'))
+    PANEL_SETUP_TRACKS_AND_VIAS.TransferDataFromWindow(v, aBoard, changed);
+  if (changed('teardrops')) PANEL_SETUP_TEARDROPS.TransferDataFromWindow(v.teardrops, aBoard);
+  if (changed('tuning')) PANEL_SETUP_TUNING_PATTERNS.TransferDataFromWindow(v.tuning, aBoard);
+  if (changed('tuningProfiles'))
+    PANEL_SETUP_TUNING_PROFILES.TransferDataFromWindow(v.tuningProfiles, aProject);
+  if (changed('netClasses'))
+    PANEL_SETUP_NETCLASSES.TransferDataFromWindow(
+      v.netClasses,
+      aProject.GetProjectFile().NetSettings(),
+    );
+  if (changed('componentClasses'))
+    PANEL_ASSIGN_COMPONENT_CLASSES.TransferDataFromWindow(v.componentClasses, aProject);
+  if (changed('drcSeverities'))
+    PANEL_SETUP_SEVERITIES.TransferDataFromWindow(v.drcSeverities, aBoard);
+  if (changed('embeddedFiles'))
+    modified =
+      PANEL_EMBEDDED_FILES.TransferDataFromWindow(v.embeddedFiles, aBoard.GetEmbeddedFiles()) ||
+      modified;
+  if (changed('zones')) PANEL_SETUP_ZONES.TransferDataFromWindow(v.zones, aBoard);
   return modified;
 }
 
@@ -428,7 +454,7 @@ interface Props {
   /** m_frame, which Component Classes reads the selection from and highlights through. */
   frame?: PCB_EDIT_FRAME | null;
   initialPage?: PageId;
-  onOk: (next: BoardSetupValues) => void;
+  onOk: (next: BoardSetupValues, edited: ReadonlySet<keyof BoardSetupValues>) => void;
   onClose: () => void;
 }
 
@@ -457,7 +483,12 @@ export function ImportBoardSetupSettings(
   }
   if (opts.formatting) next.formatting = structuredClone(other.formatting);
   if (opts.constraints) next.constraints = structuredClone(other.constraints);
-  if (opts.netclasses) next.netClasses = structuredClone(other.netClasses);
+  if (opts.netclasses) {
+    next.netClasses = structuredClone(other.netClasses);
+    // Import replaces values by name; only the destination can supply a source identity.
+    const origins = new Map(v.netClasses.classes.map((r) => [r.name, r.originalName]));
+    for (const row of next.netClasses.classes) row.originalName = origins.get(row.name);
+  }
   if (opts.componentClasses) next.componentClasses = structuredClone(other.componentClasses);
   if (opts.tracksAndVias) {
     next.trackWidthsMM = [...other.trackWidthsMM];
@@ -852,6 +883,11 @@ export function DialogBoardSetup({
               focusId: layerNameInputId(bad.layerId),
             };
 
+          if (frame && editedBoardSetupFields(value, v).has('netClasses')) {
+            const error = frame.NetclassRenameError(v.netClasses.classes);
+            if (error) return { message: error, page: 'netclasses' };
+          }
+
           const outOfRange = validateConstraints(v.constraints);
           if (outOfRange) return outOfRange;
 
@@ -885,21 +921,24 @@ export function DialogBoardSetup({
           // `TransferDataFromWindow` clamps m_MaxError on the way out
           // (`panel_setup_constraints.cpp:161-165`); it is the one value on
           // Constraints that is not stored as typed.
-          onOk({
-            ...v,
-            constraints: {
-              ...v.constraints,
-              maxDeviationMM: clampMaxErrorMM(v.constraints.maxDeviationMM),
+          onOk(
+            {
+              ...v,
+              constraints: {
+                ...v.constraints,
+                maxDeviationMM: clampMaxErrorMM(v.constraints.maxDeviationMM),
+              },
+              // `TransferDataFromWindow` drops the empty rows and sorts what is
+              // left, every time — not only when the Sort button was pressed.
+              trackWidthsMM: normalizeSizeRows(
+                v.trackWidthsMM.map((width) => ({ width })),
+                ['width'],
+              ).map((r) => r.width),
+              viaSizesMM: normalizeSizeRows(v.viaSizesMM, ['diameter', 'drill']),
+              diffPairsMM: normalizeSizeRows(v.diffPairsMM, ['width', 'gap', 'viaGap']),
             },
-            // `TransferDataFromWindow` drops the empty rows and sorts what is
-            // left, every time — not only when the Sort button was pressed.
-            trackWidthsMM: normalizeSizeRows(
-              v.trackWidthsMM.map((width) => ({ width })),
-              ['width'],
-            ).map((r) => r.width),
-            viaSizesMM: normalizeSizeRows(v.viaSizesMM, ['diameter', 'drill']),
-            diffPairsMM: normalizeSizeRows(v.diffPairsMM, ['width', 'gap', 'viaGap']),
-          });
+            editedBoardSetupFields(value, v),
+          );
         }}
         onCancel={onClose}
       />

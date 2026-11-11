@@ -227,13 +227,16 @@ export function applyDisplayState(
     !mapsEqual(aPrev.visibleElements, aState.visibleElements);
 
   if (visibilityChanged) {
-    const visible = new LSET();
-
-    for (const layer of aState.visibleLayers) visible.set(layer);
+    // Only enabled layers have rows in the Appearance panel.
+    const visible = new LSET(aBoard.GetVisibleLayers());
+    for (const layer of aBoard.GetEnabledLayers().Seq())
+      visible.set(layer, aState.visibleLayers.has(layer));
 
     aBoard.SetVisibleLayers(visible);
 
-    for (const [layer, on] of aState.visibleElements) aBoard.SetElementVisibility(layer, on);
+    for (const [layer, on] of aState.visibleElements) {
+      if (!aPrev || aPrev.visibleElements.get(layer) !== on) aBoard.SetElementVisibility(layer, on);
+    }
 
     aPanel.SyncLayersVisibility(aBoard);
   }

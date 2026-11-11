@@ -16,22 +16,28 @@
  * Differences from the desktop, each forced by the browser:
  * - `wxFileName::IsOk()` / `IsDirWritable()` / `Exists()` on the project file
  *   become "the project has a name" and "the project is not read-only".
- * - `SETTINGS_MANAGER::SaveProject()` returns the two JSON documents instead
- *   of writing them; `SaveProjectLocalSettings` hands them back so the window
- *   can persist them to the project's file store.
+ * - In addition to writes on the mount, `SaveProjectLocalSettings` returns
+ *   the documents the window should persist to the project's file store.
  * - `LoadWindowState( fn )` — the window's size and position — is the host's
  *   (the browser tab has no window geometry to restore).
  * - `DS_DATA_MODEL::LoadDrawingSheet` takes the file's text; the resolved
  *   name is looked up in the project's files through `aReadFile`.
  */
-import { COLOR4D_UNSPECIFIED, type Color4d } from '@ziroeda/common/gal/color4d.js';
+import { COLOR4D_UNSPECIFIED, type Color4d, toCssString } from '@ziroeda/common/gal/color4d.js';
 import { BASE_SCREEN } from '@ziroeda/common/base_screen.js';
 import { DS_DATA_MODEL } from '@ziroeda/common/drawing_sheet/ds_data_model.js';
 import { FILENAME_RESOLVER } from '@ziroeda/common/filename_resolver.js';
 import { Pgm, PgmOrNull } from '@ziroeda/common/pgm_base.js';
 import { PCB_SELECTION_FILTER_OPTIONS } from '@ziroeda/common/project/board_project_settings.js';
-import type { JsonObject } from '@ziroeda/common/settings/json_settings.js';
+import { wxWriteFileSync } from '@ziroeda/wx/filefn.js';
+import { DumpJson } from '@ziroeda/common/settings/json_dump.js';
+import {
+  jsonEquals,
+  type JsonValue,
+  type JsonObject,
+} from '@ziroeda/common/settings/json_settings.js';
 import type { NETINFO_LIST } from './netinfo_list.js';
+import type { NetClassRow } from '@ziroeda/common/project/net_settings.js';
 import type { PCB_EDIT_FRAME } from './pcb_edit_frame.js';
 import { PCB_DISPLAY_OPTIONS, type PCB_PAINTER } from './pcb_painter.js';
 
@@ -68,14 +74,111 @@ export function IsUnspecifiedColor(aColor: Color4d): boolean {
   );
 }
 
-/** What `SaveProjectLocalSettings` hands the window to persist: `SaveProject()`'s two files. */
+function object(value: JsonValue | undefined): value is JsonObject {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function uniqueNetclasses(rows: JsonValue[]): Map<string, JsonObject | undefined> {
+  const byName = new Map<string, JsonObject | undefined>();
+  for (const row of rows) {
+    if (!object(row) || !Object.hasOwn(row, 'name')) continue;
+    // The loader stringifies malformed names, so they can collide with a valid row.
+    const name = String(row.name);
+    const unique = typeof row.name === 'string' && name.length > 0 && !byName.has(name);
+    byName.set(name, unique ? row : undefined);
+  }
+  return byName;
+}
+
+/** Replay live edits onto the source: unchanged fields keep even their original absence. */
+function applySettingsEdit(
+  source: JsonValue | undefined,
+  before: JsonValue | undefined,
+  after: JsonValue,
+  path: string[] = [],
+  origins?: ReadonlyMap<string, string>,
+): JsonValue {
+  if (object(after) && (object(before) || object(source))) {
+    const old = object(before) ? before : {};
+    const entries = new Map(Object.entries(object(source) ? source : {}));
+    for (const key of Object.keys(old)) if (!Object.hasOwn(after, key)) entries.delete(key);
+    for (const [key, value] of Object.entries(after)) {
+      // Even identical live values can represent different source rows after a name swap.
+      const classOrigins =
+        (path.length === 0 && key === 'net_settings') ||
+        (path.length === 1 && path[0] === 'net_settings' && key === 'classes')
+          ? origins
+          : undefined;
+      if (classOrigins || !Object.hasOwn(old, key) || !jsonEquals(old[key]!, value))
+        entries.set(
+          key,
+          applySettingsEdit(entries.get(key), old[key], value, [...path, key], classOrigins),
+        );
+    }
+    return Object.fromEntries(entries);
+  }
+  if (Array.isArray(before) && Array.isArray(after) && Array.isArray(source)) {
+    if (path.length === 2 && path[0] === 'net_settings' && path[1] === 'classes') {
+      const originals = uniqueNetclasses(source);
+      const previous = uniqueNetclasses(before);
+      const current = uniqueNetclasses(after);
+      return after.map((row) => {
+        // Only a unique original row may contribute fields the panel cannot edit.
+        if (!object(row) || typeof row.name !== 'string' || current.get(row.name) !== row)
+          return row;
+        const name = origins ? origins.get(row.name) : row.name;
+        if (!name) return row;
+        const original = originals.get(name);
+        const old = previous.get(name);
+        return original && old ? applySettingsEdit(original, old, row, path) : row;
+      });
+    }
+    if (before.length === after.length && source.length === after.length)
+      return after.map((value, i) =>
+        jsonEquals(before[i]!, value)
+          ? source[i]!
+          : applySettingsEdit(source[i], before[i], value, [...path, String(i)]),
+      );
+  }
+  return after;
+}
+
+/** A null pro leaves the original project bytes in the host's file store. */
 export interface SAVED_PROJECT_FILES {
-  pro: JsonObject;
+  pro: JsonObject | null;
   prl: JsonObject;
 }
 
 /** `PCB_EDIT_FRAME`'s `pcbnew_config.cpp` half, mixed into that class by `pcb_edit_frame.ts`. */
 export class PCBNEW_CONFIG_MIXIN {
+  /** Frame-owned values copied to the project on File > Save. */
+  ProjectSettingsSnapshot(this: PCB_EDIT_FRAME, aFromProject = false) {
+    const painter = this.GetCanvas()?.GetView().GetPainter() as PCB_PAINTER | undefined;
+    const project = this.Prj().GetProjectFile();
+    // On reload the window applies the project's colours to the painter after this call.
+    const colors = aFromProject
+      ? NetColorAssignmentsToCodes(
+          this.GetBoard()!.GetNetInfo(),
+          project.NetSettings().GetNetColorAssignments(),
+          IsUnspecifiedColor,
+        )
+      : painter?.GetSettings().GetNetColorMap();
+    return {
+      sheet: BASE_SCREEN.m_DrawingSheetFileName,
+      presets: JSON.stringify(this.m_appearancePanel?.GetUserLayerPresets()),
+      viewports: JSON.stringify(this.m_appearancePanel?.GetUserViewports()),
+      exclusions: JSON.stringify(
+        [...this.GetBoard()!.Markers()]
+          .filter((m) => m.GetRCItem() && m.IsExcluded())
+          .map((m) => [m.SerializeToString(), m.GetComment()])
+          .sort(),
+      ),
+      colors: new Map(
+        Array.from(colors ?? [], ([code, color]) => [code, toCssString(color)] as const),
+      ),
+    };
+  }
+
   /**
    * `PCB_EDIT_FRAME::LoadDrawingSheet` (pcbnew_config.cpp:44-62): the drawing
    * sheet named in the project, resolved against the project path and the
@@ -189,7 +292,7 @@ export class PCBNEW_CONFIG_MIXIN {
   /**
    * `PCB_EDIT_FRAME::SaveProjectLocalSettings` (pcbnew_config.cpp:141-193).
    *
-   * @return the `.kicad_pro` / `.kicad_prl` `SaveProject()` wrote, for the
+   * @return the local settings and, if edited, the project settings for the
    *         window to persist; null when nothing was saved.
    */
   SaveProjectLocalSettings(this: PCB_EDIT_FRAME): SAVED_PROJECT_FILES | null {
@@ -207,23 +310,27 @@ export class PCBNEW_CONFIG_MIXIN {
     // save some local settings like appearance control settings
     this.saveProjectSettings();
 
-    // TODO: Can this be pulled out of BASE_SCREEN?
-    project.m_BoardDrawingSheetFile = BASE_SCREEN.m_DrawingSheetFileName;
+    if (prj.IsNullProject()) return null;
 
-    if (this.m_appearancePanel) {
+    const prev = this.m_savedFrameSettings;
+    const next = this.ProjectSettingsSnapshot();
+    if (prev?.sheet !== next.sheet)
+      project.m_BoardDrawingSheetFile = BASE_SCREEN.m_DrawingSheetFileName;
+
+    if (this.m_appearancePanel && prev?.presets !== next.presets)
       project.m_LayerPresets.splice(
         0,
         project.m_LayerPresets.length,
         ...this.m_appearancePanel.GetUserLayerPresets(),
       );
+    if (this.m_appearancePanel && prev?.viewports !== next.viewports)
       project.m_Viewports.splice(
         0,
         project.m_Viewports.length,
         ...this.m_appearancePanel.GetUserViewports(),
       );
-    }
 
-    this.GetBoard()!.RecordDRCExclusions();
+    if (prev?.exclusions !== next.exclusions) this.GetBoard()!.RecordDRCExclusions();
 
     // Save render settings that aren't stored in PCB_DISPLAY_OPTIONS
 
@@ -231,20 +338,76 @@ export class PCBNEW_CONFIG_MIXIN {
     const nets = this.GetBoard()!.GetNetInfo();
     const renderSettings = (this.GetCanvas()!.GetView().GetPainter() as PCB_PAINTER).GetSettings();
 
-    netSettings.ClearNetColorAssignments();
+    if (!prev) netSettings.ClearNetColorAssignments();
+    else
+      for (const code of prev.colors.keys()) {
+        const net = nets.GetNetItem(code);
+        if (!next.colors.has(code) && net)
+          netSettings.GetNetColorAssignments().delete(net.GetNetname());
+      }
 
     for (const [netcode, color] of renderSettings.GetNetColorMap()) {
       const net = nets.GetNetItem(netcode);
 
-      if (net) netSettings.SetNetColorAssignment(net.GetNetname(), color);
+      if (net && (!prev || prev.colors.get(netcode) !== next.colors.get(netcode)))
+        netSettings.SetNetColorAssignment(net.GetNetname(), color);
     }
 
-    // The below automatically saves the project on exit, which is what we want to do if the
-    // project already exists.  If the project doesn't already exist, we don't want to create it
-    // through this function call (see pcbnew_config.cpp:182-189).
-    if (!prj.IsNullProject()) return Pgm().GetSettingsManager().SaveProject();
+    this.m_savedFrameSettings = next;
+    return this.SaveEditedProjectSettings();
+  }
 
+  /** Check before accepting the panel: the live model has collapsed duplicate source names. */
+  NetclassRenameError(this: PCB_EDIT_FRAME, classes: readonly NetClassRow[]): string | null {
+    const settings = this.m_savedProjectSettings?.source.net_settings;
+    const source = uniqueNetclasses(
+      object(settings) && Array.isArray(settings.classes) ? settings.classes : [],
+    );
+    if (source.has('') && classes.some((row) => !row.originalName))
+      return 'Fix the empty netclass name in the project file, then reopen Board Setup.';
+    const names = new Set<string>();
+    for (const { name, originalName } of classes) {
+      if (!name.trim() || names.has(name))
+        return 'Give each netclass a non-empty, unique name before saving.';
+      names.add(name);
+      if (
+        originalName &&
+        name !== originalName &&
+        source.has(originalName) &&
+        !source.get(originalName)
+      )
+        return `Cannot rename "${originalName}": fix its duplicate or invalid name in the project file, then reopen Board Setup.`;
+    }
     return null;
+  }
+
+  /** Board Setup, individual edits and File > Save share this write boundary. */
+  SaveEditedProjectSettings(
+    this: PCB_EDIT_FRAME,
+    classes?: readonly NetClassRow[],
+  ): SAVED_PROJECT_FILES | null {
+    const prj = this.Prj();
+    if (prj.IsNullProject() || prj.IsReadOnly()) return null;
+    const baseline = this.m_savedProjectSettings;
+    if (!baseline) return Pgm().GetSettingsManager().SaveProject(prj);
+    const current = prj.GetProjectFile().SnapshotToJson();
+    let pro: JsonObject | null = null;
+    const origins = classes?.some((r) => r.originalName !== r.name)
+      ? new Map(classes.map((r) => [r.name, r.originalName ?? '']))
+      : undefined;
+    if (origins || !jsonEquals(baseline.live, current)) {
+      const merged = applySettingsEdit(
+        baseline.source, baseline.live, current, [], origins,
+      ) as JsonObject;
+      if (!origins || !jsonEquals(baseline.source, merged)) {
+        pro = merged;
+        wxWriteFileSync(prj.GetProjectFullName(), new TextEncoder().encode(DumpJson(pro)));
+      }
+      this.m_savedProjectSettings = { source: merged, live: current };
+    }
+    const local = prj.GetLocalSettings();
+    local.SaveToFile(prj.GetProjectPath());
+    return { pro, prl: local.SaveToJson() };
   }
 
   /** `PCB_EDIT_FRAME::saveProjectSettings` (pcbnew_config.cpp:196-249). */
@@ -262,7 +425,8 @@ export class PCBNEW_CONFIG_MIXIN {
 
     // Save appearance control settings
     localSettings.m_ActiveLayer = this.GetActiveLayer();
-    localSettings.m_ActiveLayerPreset = this.m_appearancePanel?.GetActiveLayerPreset() ?? '';
+    if (this.m_appearancePanel)
+      localSettings.m_ActiveLayerPreset = this.m_appearancePanel.GetActiveLayerPreset();
 
     const displayOpts = this.GetDisplayOptions();
 

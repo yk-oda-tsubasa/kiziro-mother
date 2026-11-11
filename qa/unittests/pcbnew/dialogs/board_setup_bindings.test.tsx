@@ -7,6 +7,8 @@
  * stackup's labels: a sublayer's "(i/n)", thicknesses in the frame's units, Remove's enable.
  */
 import { SetMessageDialogPresenter } from '@ziroeda/common/confirm.js';
+import { PanelSetupNetclasses } from '@ziroeda/common/dialogs/panel_setup_netclasses.js';
+import { blankNetClass, defaultNetClasses } from '@ziroeda/common/project/net_settings.js';
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { type JSX, useState } from 'react';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -25,6 +27,32 @@ import {
 import { freshBoardSetup } from '../../designer/board_setup_test_utils.js';
 
 afterEach(cleanup);
+
+it('moves the original name with the renamed panel row and updates its pattern', () => {
+  const data = defaultNetClasses();
+  for (const name of ['Power', 'Signal'])
+    data.classes.push({ ...blankNetClass(name), originalName: name });
+  data.assignments = [{ pattern: 'V*', netClass: 'Power' }];
+  let latest = data;
+  function Harness(): JSX.Element {
+    const [value, setValue] = useState(data);
+    latest = value;
+    return <PanelSetupNetclasses value={value} onChange={setValue} />;
+  }
+  render(<Harness />);
+  const cell = document.querySelector('table[aria-label="Netclasses"] td[data-col="0"]')!;
+  fireEvent.mouseDown(cell, { button: 0 });
+  fireEvent.mouseUp(cell);
+  const input = cell.querySelector('input')!;
+  fireEvent.change(input, { target: { value: 'Rails' } });
+  fireEvent.blur(input);
+  fireEvent.click(screen.getByRole('button', { name: 'Move down' }));
+  expect(latest.classes.slice(1).map(({ name, originalName }) => [name, originalName])).toEqual([
+    ['Signal', 'Signal'],
+    ['Rails', 'Power'],
+  ]);
+  expect(latest.assignments).toEqual([{ pattern: 'V*', netClass: 'Rails' }]);
+});
 
 const pick = (aCombo: HTMLElement, aLabel: string): void => {
   fireEvent.click(aCombo.closest('.ze-combo') as HTMLElement);

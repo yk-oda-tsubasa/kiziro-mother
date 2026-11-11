@@ -23,6 +23,7 @@
  * them with the `onSaveBoard` prop the host already owns.
  */
 import type { RawFile } from '@ziroeda/common';
+import { DumpJson } from '@ziroeda/common/settings/json_dump.js';
 import type { JsonValue } from '@ziroeda/common/settings/json_settings.js';
 import { IO_ERROR } from '@ziroeda/common/exceptions.js';
 import { EMBEDDED_FILES } from '@ziroeda/common/embedded_files.js';
@@ -45,11 +46,33 @@ import type { APP_SETTINGS_BASE } from '@ziroeda/common/settings/app_settings.js
 import type { BOARD } from './board.js';
 import type { FOOTPRINT } from './footprint.js';
 import { FOOTPRINT_IMPORT_RECONCILER } from './footprint_import_reconciler.js';
-import { findProjectDru, findProjectPrl, findProjectPro } from './pcb_edit_frame.js';
+import { druFileName, findProjectDru, findProjectPrl, findProjectPro } from './pcb_edit_frame.js';
+import type { NetClassRow } from '@ziroeda/common/project/net_settings.js';
 import type { PCB_EDIT_FRAME } from './pcb_edit_frame.js';
 
 /** `PCB_EDIT_FRAME`'s `files.cpp` half, mixed into that class by `pcb_edit_frame.ts`. */
 export class FILES_MIXIN {
+  /** Host writes requested by Board Setup OK and immediate project edits (e.g. net colour). */
+  SaveExplicitProjectFiles(
+    this: PCB_EDIT_FRAME,
+    files: readonly RawFile[],
+    rootPro?: string,
+    rules?: string,
+    classes?: readonly NetClassRow[],
+  ): { name: string; text: string }[] {
+    const pro = findProjectPro(files, rootPro);
+    const saved = this.SaveEditedProjectSettings(classes);
+    if (!pro || !saved) return [];
+    const writes = [];
+    if (saved.pro) writes.push({ name: pro.name, text: DumpJson(saved.pro) });
+    if (rules !== undefined) {
+      const dru = findProjectDru(files, rootPro);
+      if (dru ? rules !== dru.text : rules.trim() !== '')
+        writes.push({ name: dru?.name ?? druFileName(pro.name), text: rules });
+    }
+    return writes;
+  }
+
   /**
    * The project's slices into the live BOARD, as `BOARD::SetProject` binds
    * `bds.m_NetSettings` to the project file's NET_SETTINGS and
@@ -113,8 +136,21 @@ export class FILES_MIXIN {
     const setProject = aFromBoardSetup || proPath !== manager.Prj().GetProjectFullName();
 
     if (setProject) {
+      // A project settings edit replaces the project file, while the open board
+      // still owns any unsaved Appearance toggles.
+      const local =
+        aFromBoardSetup && proPath === manager.Prj().GetProjectFullName()
+          ? manager.Prj().GetLocalSettings()
+          : null;
       if (manager.GetProject(proPath)) manager.UnloadProject(manager.GetProject(proPath));
       manager.LoadProject(proPath, proJson, prlJson);
+      if (local) manager.Prj().setLocalSettings(local);
+    } else {
+      // Another editor may have activated this project without its .kicad_prl.
+      manager
+        .Prj()
+        .GetLocalSettings()
+        .LoadFromJson(prlJson ?? {});
     }
 
     kb.SetProject(manager.Prj());
@@ -141,6 +177,11 @@ export class FILES_MIXIN {
     }
     const dru = findProjectDru(files, rootPro);
     this.OnBoardLoaded(dru?.text ?? null, dru?.name ?? '');
+    this.m_savedFrameSettings = this.ProjectSettingsSnapshot(true);
+    this.m_savedProjectSettings = {
+      source: proJson && typeof proJson === 'object' && !Array.isArray(proJson) ? proJson : {},
+      live: manager.Prj().GetProjectFile().SnapshotToJson(),
+    };
     // The load stops here: OnBoardLoaded's own tail (SetActiveLayer + a full
     // UpdateAllItems) is the first display sync of the board, in pcb_canvas.
   }
