@@ -1,5 +1,7 @@
 # KiCad ローカル引き渡し
 
+KiZiro Mother の回路図と PCB の正式な対応デスクトップ版は KiCad 10.0.8 です。
+
 Windows / Python 3.14。リポジトリ直下から次を実行すると、日本語の選択ダイアログが開きます。
 
 ```powershell

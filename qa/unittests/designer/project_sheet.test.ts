@@ -21,6 +21,15 @@ const WKS = `(kicad_wks (version 20231118) (generator "pl_editor")
   (rect (name "") (start 0 0 ltcorner) (end 0 0) (repeat 2) (incrx 2) (incry 2)))`;
 
 describe('project drawing-sheet reference', () => {
+  it('preserves project bytes when Page Settings only changes a sheet comment', () => {
+    const pro = '{"schematic":{"page_layout_descr_file":""},"scale":1.0}\r\n';
+    expect(writeSheetRefText(pro, '')).toBe(pro);
+    expect(JSON.parse(writeSheetRefText(pro, 'frame.kicad_wks')!)).toEqual({
+      schematic: { page_layout_descr_file: 'frame.kicad_wks' },
+      scale: 1,
+    });
+  });
+
   it('defaults to empty, round-trips through writeSheetRefText/readSheetRef', () => {
     const files = [
       { name: 'proj.kicad_pro', text: PRO },

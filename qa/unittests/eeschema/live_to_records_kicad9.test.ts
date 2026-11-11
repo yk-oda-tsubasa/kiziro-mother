@@ -51,7 +51,7 @@ const childText = `${header(3)} ${title}
 beforeEach(() => SetPgm(new PGM_BASE(null, new SETTINGS_MANAGER())));
 afterEach(() => SetPgm(null));
 
-function open(version = 20250114) {
+function open(version = 20250114, rootText = parentText) {
   const frame = new SCH_EDIT_FRAME({
     crossProbingSettings: () => new CROSS_PROBING_SETTINGS(),
     saveProject: () => true,
@@ -59,7 +59,7 @@ function open(version = 20250114) {
   let text = childText.replace('20250114', String(version));
   if (version === 20260306) text = text.replace('(convert 2)', '(body_style 2)');
   const docs = new Map([
-    [root, readSchematicText(parentText, root)],
+    [root, readSchematicText(rootText, root)],
     [child, readSchematicText(text, child)],
   ]);
   const schematic = openRecordsLive(frame, { dir: '/project', root, docs, files: [] })!;
@@ -119,13 +119,19 @@ it('rejects a real position-file exclusion and keeps the source baseline', () =>
   expect(save).toThrow(/lib_symbols/);
 });
 
-it('keeps the current-format path for a KiCad 10 child', () => {
-  const { screen, symbol, save } = open(20260306);
+it('snapshots an untouched KiCad 10 root verbatim and writes its edited child natively', () => {
+  const rootText = parentText.replace('20250114', '20260306').trimEnd() + '\r\n\r\n';
+  const { docs, screen, symbol, save } = open(20260306, rootText);
   screen.GetTitleBlock().SetComment(0, 'new format');
   symbol.SetExcludedFromPosFiles(true);
   const doc = save();
   expect(doc.version).toBe(20260306);
-  expect(serialize(writeSchematic(doc))).toContain('(in_pos_files no)');
+  docs.set(child, doc);
+  const snapshot = new Map(serializeSheetFiles(docs).map(({ name, text }) => [name, text]));
+  expect(snapshot.get(root)).toBe(rootText);
+  expect(snapshot.get(child)).toBe(serialize(writeSchematic(doc)));
+  expect(snapshot.get(child)).toContain('"new format"');
+  expect(snapshot.get(child)).toContain('(in_pos_files no)');
 });
 
 // Set KICAD9_CLI to opt into the exact native parser check.

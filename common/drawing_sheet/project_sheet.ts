@@ -15,6 +15,7 @@
  */
 
 import { parseDrawingSheet, type WksSheet } from '../index.js';
+import { type JsonObject, jsonEquals } from '../settings/json_settings_internals.js';
 
 /** A raw project file (name + text), matching the schematic editor's PickedFile. */
 export interface RawFile {
@@ -62,8 +63,10 @@ export function writeSheetRefText(proText: string, name: string): string | null 
     const j = JSON.parse(proText) as Record<string, unknown>;
     const schematic =
       j.schematic && typeof j.schematic === 'object'
-        ? (j.schematic as Record<string, unknown>)
+        ? (j.schematic as JsonObject)
         : {};
+    // Page Settings also accepts comment-only edits; keep the original project text in that case.
+    if (jsonEquals(schematic.page_layout_descr_file ?? null, name)) return proText;
     schematic.page_layout_descr_file = name;
     j.schematic = schematic;
     return `${JSON.stringify(j, null, 2)}\n`;

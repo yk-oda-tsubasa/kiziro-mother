@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { parse, serialize, type SList } from '@ziroeda/sexpr/index.js';
+import { SEXPR_SCHEMATIC_FILE_VERSION } from '../../sch_file_versions.js';
 import type { Schematic } from '../../types.js';
 import { readSchematic } from './read-schematic.js';
 import { writeSchematic } from './write-schematic.js';
@@ -16,7 +17,11 @@ export function readSchematicText(text: string, fileName: string): Schematic {
 
 export function recordFromSource(source: SList, fileName: string, text?: string): Schematic {
   const record = { ...readSchematic(source), fileName };
-  if (isPreservedVersion(record.version)) exactTexts.set(record, text ?? serialize(source));
+  if (record.version === SEXPR_SCHEMATIC_FILE_VERSION && text !== undefined) {
+    exactTexts.set(record, text);
+  } else if (isPreservedVersion(record.version)) {
+    exactTexts.set(record, text ?? serialize(source));
+  }
   return record;
 }
 
