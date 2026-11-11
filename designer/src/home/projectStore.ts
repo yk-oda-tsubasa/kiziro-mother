@@ -753,7 +753,11 @@ export async function listProjects(): Promise<ProjectMeta[]> {
 
 /** Autosave: replace only the given files in a project (by name), re-gzipping
  *  just those and leaving every other file (pcb, models, binaries) untouched. */
-export async function updateProjectFiles(id: string, changed: StoredFile[]): Promise<void> {
+export async function updateProjectFiles(
+  id: string,
+  changed: StoredFile[],
+  expectedSource?: StoredFile,
+): Promise<void> {
   if (changed.length === 0) return;
   // Read-modify-write over the whole record: without the lock, a second tab
   // saving between the read and the put loses everything the first tab wrote,
@@ -762,6 +766,17 @@ export async function updateProjectFiles(id: string, changed: StoredFile[]): Pro
   let mirrorName = '';
   await withRecordLock(id, async () => {
     const r = await tx<StoredRecord | undefined>('readonly', (s) => s.get(id));
+    if (expectedSource) {
+      if (r?.cloudRole === 'viewer') throw new Error('This project is read only.');
+      const stored = r?.files.find((f) => f.name === expectedSource.name);
+      const bytes = stored && (await gunzip(stored.gz));
+      if (
+        !bytes ||
+        bytes.length !== expectedSource.bytes.length ||
+        !bytes.every((b, i) => b === expectedSource.bytes[i])
+      )
+        throw new Error('The stored board changed or no longer exists. Reopen it before saving.');
+    }
     if (!r) return;
     const byName = new Map(r.files.map((f) => [f.name, f]));
     const now = Date.now();

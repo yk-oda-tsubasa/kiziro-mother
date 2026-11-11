@@ -23,6 +23,7 @@ import type { SYMBOL_EDITOR_REQUEST } from '@ziroeda/eeschema/symbol_editor/symb
 import { HomePage } from './home/HomePage.js';
 import type { PickedFile } from '@ziroeda/eeschema/sch_edit_frame_ui.js';
 import { EMPTY_PCB } from './home/new_project.js';
+import { nativeBoardEntry } from './editors/pcb/board_entry.js';
 import { IsOK } from '@ziroeda/common/confirm.js';
 import { ProgressDialog } from '@ziroeda/common/widgets/wx_progress_reporters.js';
 import { ProjectSyncProvider } from './sync/ProjectSyncProvider.js';
@@ -121,6 +122,7 @@ const SchematicEditor = lazy(() =>
  * Preferences, so a static import of it here put all of that in the entry
  * chunk (5.5 MB, past the service worker's 2 MiB precache limit).
  */
+const WidthEditor9 = lazy(() => import('./editors/pcb/WidthEditor9.js'));
 const PcbEditorMount = lazy(() =>
   import('./editors/pcb/pcbnew_app.js').then((m) => ({ default: m.PcbEditorMount })),
 );
@@ -398,7 +400,9 @@ const BINARY_RE = /\.(png|jpe?g|gif|bmp|pdf|zip|step|stp|stl|wrl|glb)$/i;
 const pickedFromStored = (f: { name: string; bytes: Uint8Array }): PickedFile =>
   BINARY_RE.test(f.name) || isBinaryBytes(f.bytes)
     ? { name: f.name, text: '', bytes: f.bytes }
-    : { name: f.name, text: dec.decode(f.bytes) };
+    : /\.kicad_pcb$/i.test(f.name)
+      ? { ...f, text: dec.decode(f.bytes) }
+      : { name: f.name, text: dec.decode(f.bytes) };
 /**
  * A stored project's files as the editors are handed them: everything but tooling folders
  * (`.history`, `.git`), which a record imported before they were skipped still lists. They stay in
@@ -563,6 +567,7 @@ export function App(): JSX.Element {
    * chunk) re-initialise from the user's work rather than from the file.
    */
   const [openNonce, setOpenNonce] = useState(0);
+  const [pickedBoardName, setPickedBoardName] = useState<string | null>(null);
   /**
    * `MAIL_IMPORT_FILE` for the board editor: Import Non-KiCad Project's board,
    * delivered once per nonce (PcbEditor.importFileRequest).
@@ -575,6 +580,7 @@ export function App(): JSX.Element {
   /** Open a project: replace the file set, drop the previous one's edits, and
    *  tell the editors this is an open and not just a state change. */
   const openProjectFiles = useCallback((files: PickedFile[] | null) => {
+    setPickedBoardName(null);
     drainQueue.current();
     pendingWrite.current.clear();
     needsCloudPush.current = false;
@@ -1585,10 +1591,37 @@ export function App(): JSX.Element {
     if (!projectFiles) return null;
     const boards = projectFiles.filter((f) => /\.kicad_pcb$/i.test(f.name));
     // The active project's board, else any board (single-project projects).
-    return boards.find((f) => activeBase && inProject(f.name, activeBase)) ?? boards[0] ?? null;
-  }, [projectFiles, standalonePcb, activeBase]);
+    return (
+      boards.find((f) => f.name === pickedBoardName) ??
+      boards.find((f) => activeBase && inProject(f.name, activeBase)) ??
+      boards[0] ??
+      null
+    );
+  }, [projectFiles, standalonePcb, activeBase, pickedBoardName]);
   /** What the pcbnew frame is built on: the project's board, else the empty one. */
   const boardFile: PickedFile = pcbFile ?? WARM_BOARD;
+  const nativePcb = useMemo(() => nativeBoardEntry(boardFile.text, EMPTY_PCB), [boardFile.text]);
+  // The isolated form can write one board, only against the source it opened.
+  const saveWidths = async (text: string): Promise<void> => {
+    if (
+      nativePcb ||
+      demoProject ||
+      source !== editorSource.current ||
+      !source.id ||
+      !boardFile.bytes ||
+      !projectFilesRef.current?.includes(boardFile) ||
+      !storageAvailable()
+    )
+      throw new Error('Project is unavailable. Use Save a Copy.');
+    const id = source.id;
+    const file = { name: boardFile.name, bytes: enc.encode(text), text };
+    await updateProjectFiles(id, [file], { name: file.name, bytes: boardFile.bytes });
+    if (source === editorSource.current) {
+      liveEdits.current.delete(file.name);
+      setProjectFiles((prev) => prev?.map((f) => (f === boardFile ? file : f)) ?? null);
+    }
+    scheduleCloudPush(id);
+  };
   const hasSchematic = useMemo(
     () => !!projectFiles?.some((f) => /\.kicad_sch$/i.test(f.name)),
     [projectFiles],
@@ -1667,6 +1700,7 @@ export function App(): JSX.Element {
   // project active and re-roots the manager tree; it does NOT launch an editor.
   // Setting activePro re-scopes every editor's root for the next time one opens.
   const switchProject = useCallback((proFullName: string) => {
+    setPickedBoardName(null);
     setActivePro(proFullName);
   }, []);
 
@@ -2051,6 +2085,14 @@ export function App(): JSX.Element {
             // strip: demoNotice went null on the way in, so the bar the board
             // editor renders had nothing to render.
             raiseOrOpen(files);
+            // A tree open can name a secondary 9 board explicitly.
+            setPickedBoardName(
+              files.some(
+                (f) => /\.kicad_pcb$/i.test(f.name) && !nativeBoardEntry(f.text, EMPTY_PCB),
+              )
+                ? file.name
+                : null,
+            );
             setStandalonePcb(null);
           } else {
             // A lone .kicad_pcb with no project behind it. Not a demo by
@@ -2127,7 +2169,7 @@ export function App(): JSX.Element {
   return (
     <ProjectSyncProvider projectName={projectName} projectUid={openUid} view={syncView}>
       {manager}
-      {view !== 'home' && <SaveIndicator />}
+      {view !== 'home' && (view !== 'pcb' || nativePcb) && <SaveIndicator />}
       {aiEnabled() && <AiDock />}
       {schMounted && (
         <div style={frameStyle(view === 'schematic')}>
@@ -2191,7 +2233,21 @@ export function App(): JSX.Element {
           </Frozen>
         </div>
       )}
-      {pcbMounted && (
+      {pcbMounted && !nativePcb && view === 'pcb' && (
+        <div style={frameStyle(true)}>
+          <Suspense fallback={frameLoading('PCB Editor')}>
+            <WidthEditor9
+              key={`${openNonce}:${boardFile.name}`}
+              file={boardFile}
+              onExit={goHome}
+              save={source.id && !standalonePcb && storageAvailable() ? saveWidths : undefined}
+              readOnly={!!demoProject}
+              notice={frameNotice}
+            />
+          </Suspense>
+        </div>
+      )}
+      {pcbMounted && nativePcb && (
         <div style={frameStyle(view === 'pcb')}>
           <Frozen shown={view === 'pcb'}>
             <Suspense fallback={frameLoading('PCB Editor')}>
